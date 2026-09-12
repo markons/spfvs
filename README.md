@@ -50,10 +50,14 @@ set `spfvs.pythonPath` in settings if your Python isn't on PATH.
 
 ## Installing on another machine
 
-There's no Marketplace listing and no git remote yet, so getting this
-onto a second machine means moving the source there yourself (copy the
-whole `ispf-editor` folder over, zip it, whatever works) rather than
-`git clone`-ing it. Two independent things are required — independent
+There's no Marketplace listing, so getting this onto a second machine
+means cloning the (private) source repo:
+
+```
+git clone https://github.com/markons/spfvs.git
+```
+
+Two independent things are then required to actually run it — independent
 because **the packaged `.vsix` does not contain the Python backend at
 all**: `extension/.vscodeignore` strips everything down to the compiled
 `dist/`, the icon, and `package.json`, and `backend/` isn't even inside

@@ -15,6 +15,71 @@ status entry for what was and wasn't touched. Folder is
 same day; don't confuse either with the unrelated repo git finds by
 walking up to `C:\Users\maga1`).
 
+## Status as of 2026-09-13 (latest): renamed to SPFVS, published to GitHub
+
+Renamed the product from "ISPF Editor" to "SPFVS" and published it to a
+**private** GitHub repo, `https://github.com/markons/spfvs` (owner chose
+private explicitly when asked — no LICENSE yet, no Marketplace listing,
+hasn't had a full owner test pass). First commit (`a1c65b5`, "Initial
+commit: SPFVS (renamed from ISPF Editor)") pushed to `master`, tracking
+`origin/master`.
+
+**Directory situation future sessions need to know**: the folder is now
+`C:\Users\maga1\Documents\GitHub\spfvs\`, copied from (not `git mv`'d/
+renamed from) `...\ispf-editor\`. A plain directory rename was attempted
+first and failed with "Device or resource busy" — root cause turned out
+to be this coding session's OWN sandbox, which pins/anchors shell working
+directories back to the session's original primary-working-directory
+path (`...\ispf-editor\`) after every command; it wasn't a VS Code
+window or any other real lock (the owner closed VS Code entirely and it
+still failed). Fell back to copying everything except regenerable
+artifacts (`node_modules/`, `dist/`, old `.vsix` files, `__pycache__/`,
+`*.egg-info/`, `.pytest_cache/`) into a fresh `spfvs/` folder, then did
+all renaming/git/publish work there. **The old `...\ispf-editor\` folder
+was deliberately left in place on disk** — the owner said they'd delete
+it themselves once nothing has it open; don't assume it's gone, and
+don't confuse it with the new `spfvs/` folder if a future session's
+primary working directory somehow still points at the old path.
+
+What was renamed vs. deliberately left alone (don't "fix" the left-alone
+parts later without a reason — this was a scoping decision, not an
+oversight): user-facing strings changed — `extension/package.json`'s
+`name` (`spfvs`), `displayName` (`SPFVS`), the `customEditors` entry's
+`displayName`, `configuration.title`, and the settings key itself
+(`ispfEditor.pythonPath` -> `spfvs.pythonPath`, updated everywhere it's
+read: `ispfEditorProvider.ts`, and everywhere it's shown: the error
+message in `backendClient.ts`), the `.vscode/launch.json` debug config
+name, and both README.md/CLAUDE.md's titles and prose. Deliberately
+**left as `ispf`-branded internal identifiers** (no user ever sees
+these): the Python package name and import path `ispf_backend` (backend/
+pyproject.toml, all `python -m ispf_backend` invocations), the
+`ispfEditorProvider.ts` source filename and its `IspfEditorProvider`
+class name, and the `contributes.customEditors[0].viewType` string
+`"ispfEditor.editor"` in package.json (must stay in sync with
+`IspfEditorProvider.viewType` in source if either ever changes — they're
+not currently linked by anything but manual consistency).
+
+Also caught and fixed while repackaging: the manual copy missed
+`extension/.vscodeignore` entirely (it's a dotfile, not everyone's first
+`cp` includes those) — the first `spfvs-0.0.13.vsix` built without it
+came out at 2.35MB with full source/sourcemaps bundled in, versus the
+correct ~645KB. Repackaged after copying `.vscodeignore` (and
+`extension/.vscode/launch.json`+`tasks.json`, also missed) over from the
+old folder; verify vsix size looks right (compare against a prior
+build) any time packaging is touched, since `vsce` silently includes
+whatever isn't excluded rather than erroring.
+
+The old `markons.ispf-editor` VS Code extension was uninstalled and
+`markons.spfvs@0.0.13` installed in its place (this IS a different
+extension ID from VS Code's point of view, not an in-place update, since
+`name` changed — both would otherwise coexist harmlessly, but leaving
+the dead one installed seemed pointless). `npm run typecheck`, `npm run
+compile`, and `pytest` (65 tests) all re-verified passing from the new
+location before packaging/publishing. **Not yet retested by the owner
+after the rename** — the extension should behave identically to
+v0.0.13 pre-rename; this was a naming/location change only, no
+functional code changed.
+
 ## Status as of 2026-09-13 (later): prefix-command commits kept the view pinned to top
 
 Owner reported: after `)`/`>` (shift right), the view jumped to the top
@@ -241,8 +306,13 @@ wiring).
 
 **Standing convention (carried over from the owner's other repos, e.g.
 pli-pygen): do NOT commit/push until the owner has personally tested and
-approved.** This repo has no git history yet at all — don't `git init`
-or commit without being asked.
+approved.** As of 2026-09-13 this repo DOES have git history — one
+initial commit, pushed to a private GitHub repo at
+`https://github.com/markons/spfvs` (see that status entry for how/why) —
+made because the owner explicitly asked for the rename+publish in that
+same request, which is the standing convention's own carve-out ("without
+being asked"). The convention itself is unchanged going forward: don't
+commit/push again on your own initiative, only when asked.
 
 ## Architecture
 
