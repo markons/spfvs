@@ -1,0 +1,15 @@
+[project]
+name = "ispf-backend"
+version = "0.1.0"
+description = "ISPF-style prefix-command semantics backend for the spfvs VS Code extension"
+requires-python = ">=3.9"
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["ispf_backend*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

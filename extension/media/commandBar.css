@@ -1,0 +1,47 @@
+.ispf-command-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 3px 8px;
+  flex-shrink: 0;
+  background: var(--vscode-editorWidget-background, #252526);
+  border-bottom: 1px solid var(--vscode-editorGutter-background, #1e1e1e);
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--vscode-editor-font-size, 13px);
+  color: var(--vscode-editor-foreground, #d4d4d4);
+}
+
+.ispf-command-label {
+  color: var(--vscode-descriptionForeground, #9d9d9d);
+  white-space: nowrap;
+}
+
+.ispf-command-input {
+  flex: 1;
+  background: var(--vscode-input-background, transparent);
+  border: 1px solid var(--vscode-input-border, #3c3c3c);
+  color: var(--vscode-input-foreground, #cccccc);
+  font-family: inherit;
+  font-size: inherit;
+  padding: 2px 6px;
+  outline: none;
+}
+
+.ispf-command-input:focus {
+  border-color: var(--vscode-focusBorder, #007fd4);
+}
+
+.ispf-command-input:disabled {
+  opacity: 0.5;
+}
+
+.ispf-command-message {
+  white-space: nowrap;
+  color: var(--vscode-descriptionForeground, #9d9d9d);
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.ispf-command-message.ispf-command-error {
+  color: var(--vscode-errorForeground, #f14c4c);
+}

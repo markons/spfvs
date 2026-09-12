@@ -1,0 +1,48 @@
+{
+  "name": "spfvs",
+  "displayName": "SPFVS",
+  "description": "An ISPF-style custom editor with a real editable prefix-command gutter, built on Monaco.",
+  "version": "0.0.13",
+  "publisher": "markons",
+  "icon": "resources/icon.png",
+  "engines": {
+    "vscode": "^1.90.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "customEditors": [
+      {
+        "viewType": "ispfEditor.editor",
+        "displayName": "SPFVS",
+        "selector": [{ "filenamePattern": "*" }],
+        "priority": "option"
+      }
+    ],
+    "configuration": {
+      "title": "SPFVS",
+      "properties": {
+        "spfvs.pythonPath": {
+          "type": "string",
+          "default": "python",
+          "description": "Python executable used to launch the prefix-command backend (must be on PATH or an absolute path)."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "compile": "node esbuild.js",
+    "watch": "node esbuild.js --watch",
+    "typecheck": "tsc --noEmit -p ./",
+    "vscode:prepublish": "node esbuild.js --production"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "@types/vscode": "^1.90.0",
+    "@vscode/vsce": "^3.0.0",
+    "esbuild": "^0.23.0",
+    "monaco-editor": "^0.50.0",
+    "typescript": "^5.5.0"
+  }
+}

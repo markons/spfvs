@@ -1,0 +1,7 @@
+extension/node_modules/
+extension/dist/
+extension/out/
+extension/*.vsix
+backend/**/__pycache__/
+backend/*.egg-info/
+backend/.pytest_cache/

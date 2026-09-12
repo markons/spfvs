@@ -1,0 +1,60 @@
+.ispf-gutter {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  z-index: 10;
+  overflow: hidden;
+  /* Hardcoded (not theme-variable) colors for now, on purpose — this is
+     temporarily loud/high-contrast so it's unmistakable whether it's
+     rendering at all, independent of whether a theme variable happens to
+     resolve close to the surrounding color. */
+  background: #000000;
+  border-right: 2px solid #ffcc00;
+}
+
+.ispf-gutter-cell {
+  position: absolute;
+  top: 0;
+  left: 0;
+  right: 0;
+  width: 100%;
+  box-sizing: border-box;
+  border: none;
+  border-bottom: 1px solid #444444;
+  outline: none;
+  background: #202020;
+  color: #ffcc00;
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--vscode-editor-font-size, 13px);
+  font-weight: bold;
+  text-align: right;
+  padding: 0 4px;
+  cursor: text;
+  pointer-events: auto;
+}
+
+.ispf-gutter-cell::placeholder {
+  color: #888888;
+  opacity: 1;
+}
+
+.ispf-gutter-cell:focus {
+  color: #000000;
+  background: #ffcc00;
+}
+
+.ispf-gutter-cell-error {
+  color: var(--vscode-errorForeground, #f14c4c);
+  outline: 1px solid var(--vscode-errorForeground, #f14c4c);
+}
+
+/* A LABEL (.name) is persistent, committed state rather than a one-shot
+   command waiting to be applied — distinguished with a cooler, non-bold
+   color so it doesn't read as "an action about to happen" the way a typed
+   'd3' or 'cc' does. */
+.ispf-gutter-cell-label {
+  color: #66ccff;
+  font-weight: normal;
+  font-style: italic;
+}
