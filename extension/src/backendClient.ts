@@ -16,6 +16,14 @@ export interface LinePlanMsg {
   consumedLines: number[];
 }
 
+// A pending copy/move mark left by an unpaired c/cc/m/mm, resolved by a
+// CUT primary command (see prefix_commands.py's module docstring).
+export interface PendingMark {
+  kind: "copy" | "move";
+  start: number;
+  end: number;
+}
+
 export interface BackendResponse {
   id: number;
   errors: CommandErrorMsg[];
@@ -27,6 +35,9 @@ export interface BackendResponse {
   // Updated sorted list of excluded (hidden) line numbers after this
   // batch's x/xx ops. Same null-iff-rejected rule as labels.
   excludedLines: number[] | null;
+  // Updated pending copy/move mark (or null if none/just resolved by
+  // executeCut). Same null-iff-rejected rule as labels.
+  pendingMark: PendingMark | null;
 }
 
 /**
@@ -95,11 +106,15 @@ export class BackendClient {
     lines: string[],
     commands: RawCommand[],
     labels: Record<string, number>,
-    excludedLines: number[]
+    excludedLines: number[],
+    pendingMark: PendingMark | null,
+    executeCut = false,
+    executePaste: { line: number; before: boolean } | null = null
   ): Promise<BackendResponse> {
     const proc = this.ensureStarted();
     const id = this.nextId++;
-    const request = JSON.stringify({ id, lines, commands, labels, excludedLines }) + "\n";
+    const request =
+      JSON.stringify({ id, lines, commands, labels, excludedLines, pendingMark, executeCut, executePaste }) + "\n";
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       proc.stdin.write(request, (err) => {

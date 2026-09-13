@@ -15,6 +15,302 @@ status entry for what was and wasn't touched. Folder is
 same day; don't confuse either with the unrelated repo git finds by
 walking up to `C:\Users\maga1`).
 
+## Status as of 2026-09-14 (latest): FIND/CHANGE column-range restriction
+
+Added ISPF's `FIND string c1 c2` / `CHANGE old new c1 c2` form
+(`extension/media/primaryCommand.ts`, webview-only, no backend change):
+appending two integers right after the search text (and, for `CHANGE`,
+the replacement text too) restricts matches to ones lying **entirely**
+within columns `c1`-`c2` (1-indexed, inclusive) — `find 'xxx' 8 10` only
+matches `xxx` where it fits inside columns 8-10. Owner explicitly flagged
+this as missing ("in find and change, the ispf-like column specification
+is not implemented"), after an earlier back-and-forth in this same
+session where they said CHANGE itself was already fine (a false alarm —
+CHANGE (find/replace with FIRST/LAST/NEXT/PREV/ALL scopes) already
+existed and was already installed; column restriction was the actual,
+real gap).
+
+New `extractColumnRange(args, minRemaining)` mirrors the existing
+`extractTrailingScope` disambiguation pattern: it only claims a trailing
+`c1 c2` pair as columns if at least `minRemaining` tokens are left over
+afterward (1 for FIND's needle, 2 for CHANGE's old+new) — otherwise e.g.
+`find 100 200` (exactly two tokens, no room for both a needle AND
+columns) is read as a literal two-word search, matching a real ambiguity
+ISPF itself has (quote a numeric-looking search string to force it to be
+read as text: `find '100' 8 10`). Column filtering
+(`withinColumnRange`) checks a match's `startColumn`/`endColumn` fall
+inside the range — Monaco's `endColumn` is one PAST the last matched
+character, so the check is `startColumn >= c1 && endColumn - 1 <= c2`.
+
+Architecturally, column restriction bypasses Monaco's native
+`findNextMatch`/`findPreviousMatch` (which have no notion of column
+limits) only when a range is actually given: it instead pulls every raw
+match via `findMatches` and picks one manually via a new `pickMatch()`
+helper that replicates NEXT/PREV wrap-around by comparing match start
+positions against the cursor with a plain `comparePositions()`. With no
+column range, the original per-scope Monaco-native calls are used
+completely unchanged — deliberately keeping the (far more common)
+unrestricted path exactly as tested/shipped before, rather than
+funneling everything through the new manual-picking code and risking a
+subtle wrap-around behavior difference from Monaco's own. A bare
+`FIND`/`RFIND` repeat now also remembers and reuses the last explicit
+FIND's column range (new module-level `lastFindColumnRange`), alongside
+the existing `lastFindNeedle`/`lastFindDirection`.
+
+`npm run typecheck` and `npm run compile` both pass. No backend
+involvement, so no new pytest cases (94 still the total, unchanged) —
+this is pure webview command-parsing, same category as FIND FIRST/LAST/
+RFIND. Packaged and installed as **v0.0.18**. **Not yet tested by the
+owner.**
+
+## Status as of 2026-09-14: CUT/PASTE primary commands + pending mark, + HOME key
+
+Two features. The CUT/PASTE design below is a **correction of a prior
+same-day attempt** — worth understanding both what changed and why, in
+case a future session finds references to the old shape (e.g. in git
+history or a stale mental model): the owner's first request ("realize
+the c/cc line command to copy the selected line(s) to the clipboard by
+the cut command, as well its counterpart paste used with a/b as target")
+was genuinely ambiguous, and the first implementation guessed wrong — it
+made an unpaired `c`/`cc`/`m`/`mm` write the clipboard *immediately*, and
+a lone `a`/`b` auto-paste. The owner then corrected this explicitly:
+"c/cc m/mm functions only paired with the cut promary command. workflow:
+type c/cc m/mm by typing it on a line/line area. the use the cut promary
+command to copy/move it to the clipboard. then one can use the paste
+promary command to cy the clipboard a(fter) b(efore) the selected lin.
+and yes, cc mm without pair is an error." The corrected design below is
+what's actually implemented now; the immediate-write/auto-paste shape
+was fully reverted, not layered on top of.
+
+**1. CUT/PASTE primary commands + a persistent "pending mark"**
+
+`c[n]`/`cc`...`cc` and `m[n]`/`mm`...`mm` paired with `a`/`b` in the same
+gutter batch are **completely unchanged** — immediate in-file copy/move,
+exactly as before this whole feature existed. What's new is what happens
+when one is left **unpaired** at the end of a batch: instead of erroring
+("has no destination marker"), it becomes a **pending mark** — one
+`{kind: "copy"|"move", start, end}` slot, per-document state that
+behaves exactly like a LABEL for remapping purposes (follows a move,
+drops if its line is deleted, remapped through `line_new_key`/
+`key_to_new_line` same as labels/excluded_lines — see `process()`'s new
+`pending_mark` parameter/return value in `prefix_commands.py`). Setting
+a new mark while one is already pending is an error ("use CUT first") —
+there's only ever one slot. A lone `a`/`b` with no pending source to pair
+with is, again, an ordinary **error** ("has no pending copy or move
+command") — there is no auto-paste. An unmatched `cc`/`mm` block (opened,
+never closed) is also still an error, confirmed explicitly by the owner
+("cc mm without pair is an error").
+
+The pending mark is resolved by the new **`CUT`** primary command
+(`extension/media/primaryCommand.ts`, forwarded to the extension host as
+`{kind:"forward", action:"cut"}`, same mechanism as `resetLabels`): a
+`copy`-kind mark copies those lines into the shared clipboard
+non-destructively (reuses the `clip_copy` operation kind from the
+reverted attempt — no `delete_set` update); a `move`-kind mark cuts them
+(the `cut` operation kind, destructive). `CUT` with no pending mark is an
+error ("nothing marked for cut — use c/cc or m/mm first"). The new
+**`PASTE`** primary command (`paste`/`paste a`/`paste b`, defaulting to
+`a`) inserts the clipboard's current contents at the cursor's line,
+after or before per that argument — this is the *only* route to a paste,
+and it does not use `a`/`b` prefix codes at all (those are gutter/pairing
+concepts only). `PASTE` does not consume the clipboard (repeatable).
+Backend flags driving this: `process()` gained `execute_cut: bool` and
+`execute_paste: {"line": int, "before": bool} | None` — both are
+resolved *after* normal command pairing/errors, in that order (cut mark
+resolves into an operation, then paste reads whatever's now in the
+clipboard). `CUT`/`PASTE` themselves never appear as gutter/prefix
+commands; `prefix_commands.py`'s module docstring spells out this split.
+
+The module-level `_clipboard` global in `prefix_commands.py` is
+deliberately the ONE exception to the caller-owned-state pattern
+everything else here follows — it's real mutable process state, not
+threaded through parameters, because it must survive across `process()`
+calls for **different documents** (CUT in file A, PASTE in file B),
+which the per-document `pending_mark`/labels/excluded_lines pattern
+can't do (those are owned by `ispfEditorProvider.ts`'s per-tab closure
+and round-trip every call). `pending_mark`, by contrast, IS per-document
+closure state in `ispfEditorProvider.ts` (a new `pendingMark` variable
+alongside `labels`/`excludedLines`, same reset-on-non-batch-edit rules —
+no webview-visible display, since unlike labels there's nothing to show
+in the gutter for it). A new `handleClipboardAction()` method there
+handles both `CUT` and `PASTE` (routed from `primaryAction` when
+`message.action` is `"cut"`/`"paste"`, otherwise the existing
+`handlePrimaryAction` path is used); it explicitly skips
+`vscode.workspace.applyEdit` when a non-destructive copy's resulting
+text is identical to the document's current text, to avoid a
+no-op dirty-flag flip / undo-stack entry for an operation that shouldn't
+touch the document at all.
+
+Backend: rewrote the clipboard test block (~18 tests) covering pending-
+mark creation (single/block, copy/move), setting-while-pending is an
+error, remapping through other same-batch operations and later unrelated
+batches, dropping when the marked line is deleted, `execute_cut`
+resolving both mark kinds (and erroring with no mark), `execute_paste`
+after/before/empty-clipboard/non-consuming, and cut-in-one-batch-then-
+paste-in-a-different-document's-batch (the key cross-document check,
+since the clipboard is a process global but `pending_mark` isn't).
+**94 total tests, all passing.**
+
+**Not yet tested by the owner** — see the manual test checklist below
+for the specific workflow to try (mark, CUT, move cursor, PASTE a/b).
+
+**2. HOME jumps to the COMMAND ===> bar** — the 3270/ISPF convention of
+Home moving to the first input field on the screen.
+`extension/media/main.ts`'s `editor.onKeyDown` intercepts plain
+(no-modifier) Home ONLY when the cursor is already at `{1,1}` (i.e.
+Monaco's own Home would be a no-op anyway) — everywhere else in the main
+editor, Home keeps doing its normal, heavily-relied-on job (line start /
+smart home). `gutter.ts`'s per-cell `keydown` handler intercepts Home
+unconditionally instead, since a gutter cell's own "move caret to
+position 0 within this 1-9 character input" has negligible value.  Both
+funnel into a new shared `jumpToCommandBar()` in main.ts (focus +
+select, so typing immediately replaces whatever was there). No backend
+involvement, no new pytest cases.
+
+`npm run typecheck` and `npm run compile` both pass for both features.
+**Neither has been packaged/installed or tested by the owner yet.**
+
+## Status as of 2026-09-13 (even later): HX line command
+
+Added the `hx`/`hx[n]` prefix command: shows a line's hex representation
+as two rows underneath it (high nibble, low nibble — one hex digit per
+row per character, directly under that character, not two digits
+squeezed under one monospace column). New module
+`extension/media/hexView.ts`'s `HexView` class, driving Monaco's
+`changeViewZones`/`addZone`/`removeZone` API directly.
+
+**Architecturally this is a different animal from every other prefix
+command so far**, worth internalizing before extending it: it NEVER
+reaches the Python backend at all. Every other prefix command (even the
+purely-view ones like `x`/`xx`) goes through `gutter.ts`'s `commit()` ->
+`onCommit` -> `processPrefixCommands` -> `prefix_commands.py`. `hx` is
+intercepted INSIDE `commit()` itself (new `HEX_CODE_RE` regex check,
+before anything is pushed into the `commands` array that would otherwise
+go to the backend) and routed to a new `onHexToggle` callback instead —
+because `hx` has no batch-validation needs (can't conflict with another
+command on the same line — impossible anyway, one code per cell; can't
+go out of range — the line obviously already exists since it has a
+gutter cell) and no restructuring-remap needs (it's explicitly NOT kept
+in sync across edits — see below), routing it through the backend would
+have been pure overhead for zero benefit. A bare `hx` toggles (matches
+real ISPF); the counted form `hx3` only ever shows (never hides) each of
+the n lines, to avoid a confusing mixed on/off result if some already
+had hex shown and others didn't — asymmetric on purpose, not an
+oversight.
+
+Deliberately NOT done, to keep this simple and safe: no remapping
+through prefix-command batches the way LABEL/EXCLUDE get (`HexView`
+just clears every zone on ANY `onDidChangeModelContent`, full stop,
+rather than trying to track which lines moved where — see its class doc
+comment); no block form (`hxhx`...`hxhx`) pairing like `dd`/`cc`/`mm`/
+`xx`/`xx` get, since the ask was specifically about one selected line at
+a time (the counted form `hx3` covers "several consecutive lines"
+well enough without needing a second block-marker mechanism); no
+byte-accurate UTF-8 (each char is masked to its low byte via `& 0xFF`,
+an ISPF-flavored approximation, not a real multi-byte decode).
+
+No backend changes, no new pytest cases (pure webview view-state
+feature, same category as the earlier view-position-preservation fix).
+`npm run typecheck` and `npm run compile` both pass. **Not yet tested by
+the owner.**
+
+## Status as of 2026-09-13 (latest): 6 ISPF-parity features (RR/UC/LC/CUT-PASTE/LOCATE-by-line/PREV/SORT)
+
+Owner asked "which important ISPF editor functions are missing from
+spfvs" and got back a ranked list of ~12; asked to "realize all points,
+out of 7 and 8 (leave them for a later release)" — i.e. implement
+everything except plain-line-number EXCLUDE/DELETE ranges (#7) and the
+MASK-line/NUMBER-RENUM/CAPS-ON/HEX-ON/column-ruler/BOUNDS cluster (#8),
+both deliberately deferred, not forgotten. **All six done, none tested
+by the owner yet.**
+
+1. **`LOCATE` by plain line number** (`extension/media/primaryCommand.ts`):
+   `LOCATE 50`/`LOC 50`/`L 50` now works alongside the existing
+   `.label` form — `doLocate` gained a `model` param to validate the
+   number against `getLineCount()` and branches on `isLabelToken()`.
+2. **`UC`/`LC` case conversion** (`prefix_commands.py`): new prefix
+   commands, single-line or a two-marker range (see point 3 for why they
+   don't double to a 4-letter block form like `dd`/`cc`/`mm`/`xx` do).
+   Pure text mutation like SHIFT — doesn't touch `line_new_key`, so
+   labels/exclusion on a converted line are unaffected for free.
+3. **`RR`...`RR` block repeat** (`prefix_commands.py`): repeats a whole
+   *block* (unlike single-line `r[n]`), once by default or a caller-given
+   count on either marker (closing wins if both specify one — see the
+   `pending_rr_count` comment in `process()`). New `_BLOCK_REPEAT_RE`
+   checked before `_parse_one` gets a chance, alongside `dd`/`cc`/`mm`/`xx`
+   in the same `pending_block` pairing state machine (added an `"rr"` key).
+4. **`CUT`/`PASTE`** (`prefix_commands.py`): the big architectural one —
+   see the dedicated design-point paragraph below. **Superseded
+   2026-09-14 — see that status entry.** As originally shipped here,
+   `cut`/`paste` were themselves prefix/gutter word-commands (typed in a
+   gutter cell like any other prefix code) that read/wrote the clipboard
+   directly; the owner's next request repurposed `CUT`/`PASTE` into
+   **primary** commands (`COMMAND ===>`) that resolve a persistent
+   "pending mark" left by an unpaired `c`/`cc`/`m`/`mm` instead. The
+   clipboard mechanics described just below (module-global `_clipboard`,
+   cross-document persistence, snapshot-at-top-of-`process()`, the
+   `global` declaration ordering gotcha, the autouse reset fixture) are
+   all still accurate and reused as-is by the new design — only *what
+   triggers* a clipboard read/write changed, not the clipboard itself.
+5. **`FIND`/`CHANGE` `PREV`** + **`CHANGE` FIRST/LAST** scopes
+   (`primaryCommand.ts`): `extractFindScope` was renamed
+   `extractTrailingScope` and generalized to return `{rest, scope}`
+   instead of a pre-joined needle, so both `doFind` (joins `rest` itself)
+   and the rewritten `doChange` (needs `rest` as separate old/new tokens)
+   share it. `RFIND`/bare-`FIND` now repeat in the **same direction** as
+   the last explicit NEXT/PREV search (new `lastFindDirection` module
+   state) — FIRST/LAST/ALL don't update it, since they're one-shot jumps,
+   not a direction to continue in.
+6. **`SORT`** (`primaryCommand.ts`, new `doSort`): whole-file only (not
+   exclusion-aware like real ISPF's — see the design-point paragraph and
+   README's "Known limitations"), via a plain `editor.executeEdits` full
+   -document replace, same mechanism `CHANGE` already uses. No backend
+   involvement at all.
+
+**Design point for future sessions — the CUT/PASTE clipboard is
+deliberately NOT per-document caller-owned state like labels/
+excluded_lines.** It has to survive `process()` calls for *different*
+documents (cut in file A, paste in file B), and each open document's
+labels/excludedLines already live in a closure-local variable scoped to
+that ONE `resolveCustomTextEditor` call — there's no existing channel for
+one document's provider to hand state to another's. Solution: a genuine
+Python-process-global `_clipboard: list[str]` in `prefix_commands.py`,
+read/written directly by `process()` rather than threaded through its
+parameters/return value. This is the ONE deliberate exception to that
+module's "pure, no side effects" docstring claim (the claim itself was
+left as-is rather than rewritten, since it's still true of everything
+else in the file). Consequences worth knowing before touching this code:
+  - Tests MUST reset `prefix_commands._clipboard` between cases (added an
+    autouse `_reset_clipboard` pytest fixture in
+    `test_prefix_commands.py`) — pytest doesn't isolate module globals
+    for you.
+  - A `paste` op always reads a `clipboard_snapshot` taken at the very
+    top of `process()`, BEFORE that same batch's own operations run — a
+    `cut` and `paste` in one batch deliberately don't chain (see the
+    docstring). The real `_clipboard` global is only written at the very
+    end, after every possible error-return, so a batch that fails for an
+    unrelated reason never corrupts it (see `test_a_rejected_batch_does_
+    not_commit_a_cut_to_the_clipboard`).
+  - Unlike labels/excludedLines, nothing in `ispfEditorProvider.ts` ever
+    resets the clipboard — it's not per-document state, so there's no
+    "this document's edit invalidated it" moment to reset it on. It only
+    changes when something is next `cut`, and it's lost if the backend
+    process itself restarts (extension host reload).
+  - First attempt at `global _clipboard` placed the statement right
+    before the assignment near the bottom of `process()` and hit
+    `SyntaxError: name '_clipboard' is used prior to global declaration`
+    — Python requires `global` to appear before ANY use of the name
+    anywhere in the function (including the earlier read-only
+    `clipboard_snapshot = list(_clipboard)`), not just before the
+    assignment. Fixed by moving it to the top of `process()`.
+
+Backend: 21 new pytest cases (RR/UC/LC/CUT/PASTE), 86 total, all passing.
+`npm run typecheck` and `npm run compile` both pass on the extension
+side. **Nothing in this entry has been packaged/installed or tested by
+the owner** — see the manual test checklist below, and the standing
+package+install+relaunch gotcha in the Build section (compiling alone
+never touches the installed `.vsix`).
+
 ## Status as of 2026-09-13 (latest): renamed to SPFVS, published to GitHub
 
 Renamed the product from "ISPF Editor" to "SPFVS" and published it to a
@@ -326,8 +622,12 @@ commit/push again on your own initiative, only when asked.
     LABEL map and EXCLUDE line set, added 2026-09-12 — see Status above),
     prefix-command round trip to the Python backend, primary actions that
     need the real document or extension-host state
-    (`undo`/`undoAll`/`save`/`cancel`/`end`/`resetLabels` — see below),
-    cache-busting query param on the webview asset URLs
+    (`undo`/`undoAll`/`save`/`cancel`/`end`/`resetLabels`/`cut`/`paste`
+    via `handleClipboardAction` — see below), a `pendingMark` closure
+    variable (added 2026-09-14, same per-document/reset-on-non-batch-
+    edit treatment as `labels`/`excludedLines`, but never itself pushed
+    to the webview since there's nothing to display), cache-busting
+    query param on the webview asset URLs
     (`?v=<extension version>`, added after a debugging round where a
     stale bundle was briefly suspected).
   - `src/backendClient.ts` — spawns one persistent `python -m
@@ -342,19 +642,44 @@ commit/push again on your own initiative, only when asked.
     Also owns the LABEL display/lookup cache (`lineToLabel`/`labelToLine`,
     `setLabels()`, `resolveLabel()`) — it holds no authoritative label
     state itself, just mirrors whatever the extension host last pushed.
+    `commit()` intercepts `hx`/`hx[n]` codes (via `HEX_CODE_RE`) BEFORE
+    they'd otherwise be sent to the backend as a batch — see
+    `hexView.ts`'s class doc comment for why HX never touches the
+    backend at all, unlike every other prefix command including the
+    other view-only ones (`x`/`xx`).
+  - `media/hexView.ts` — the `HX` line command's real implementation:
+    Monaco's view-zone API (`changeViewZones`/`addZone`/`removeZone`),
+    the same "reserve space in the render, not the model" category of
+    trick `excludeFolding.ts` uses for EXCLUDE, but simpler here since HX
+    doesn't need a `FoldingRangeProvider` — just a DOM node per shown
+    line. Deliberately NOT remapped through restructuring the way LABEL/
+    EXCLUDE are (any `onDidChangeModelContent` just clears every zone).
   - `media/primaryCommand.ts` — `COMMAND ===>` bar command parsing/
-    execution. `find`/`f`, `change`/`c`, `top`/`t`, `bottom`/`bot`,
-    `locate`/`loc`/`l`, `exclude`/`x`, `reset`/`res` resolve entirely
-    client-side against Monaco's model APIs (`locate` and the two-label
-    form of `exclude` go through `gutter.ts`'s `resolveLabel` via the
-    `LabelResolver` param; `exclude`/`res` report what they changed back
-    to the extension host via the `ExcludedLinesNotifier` param, so its
+    execution. `find`/`f`/`rfind`/`rf`, `change`/`c`, `sort`, `top`/`t`,
+    `bottom`/`bot`, `locate`/`loc`/`l`, `exclude`/`x`, `reset`/`res`
+    resolve entirely client-side against Monaco's model APIs (`locate`
+    with a `.label` and the two-label form of `exclude` go through
+    `gutter.ts`'s `resolveLabel` via the `LabelResolver` param — `locate`
+    with a plain number instead validates against `model.getLineCount()`
+    directly; `exclude`/`res` report what they changed back to the
+    extension host via the `ExcludedLinesNotifier` param, so its
     `excludedLines` copy stays correct for the next gutter x/xx batch —
-    see Status above). `undo`, `cancel`/`can`, `save`, `end`/`pf3`, and
-    `reset lab`/`res lab` (-> action `resetLabels`) return
-    `{kind:"forward", action}` for the provider to execute against the
-    real document or extension-host state (see ispfEditorProvider.ts's
-    `handlePrimaryAction`).
+    see Status above; `find`/`change` share scope-keyword parsing via
+    `extractTrailingScope`, and `find`/`rfind` share direction-repeat
+    state via module-level `lastFindNeedle`/`lastFindDirection`/
+    `lastFindColumnRange` — the last added 2026-09-14 alongside ISPF's
+    `FIND`/`CHANGE` column-range restriction, `extractColumnRange`/
+    `withinColumnRange`/`pickMatch`, see Status above). `undo`,
+    `cancel`/`can`, `save`, `end`/`pf3`, `reset lab`/`res lab` (-> action
+    `resetLabels`), and (added 2026-09-14) `cut` and `paste`/`paste a`/
+    `paste b` return `{kind:"forward", action}` for the provider to
+    execute against the real document or extension-host state (see
+    ispfEditorProvider.ts's `handlePrimaryAction` for the first group and
+    `handleClipboardAction` for cut/paste). `PASTE`'s forwarded outcome
+    is the one `CommandOutcome` variant that carries extra payload
+    (`line`/`before`) alongside `action` — `main.ts`'s forwarding handler
+    spreads everything but `kind` into the posted message rather than
+    just `{action}`.
   - `media/excludeFolding.ts` — EXCLUDE/RESET/x/xx's real implementation:
     Monaco's public folding API (`registerFoldingRangeProvider` +
     `editor.fold`/`editor.unfoldAll` triggers), NOT the lower-level
@@ -373,20 +698,35 @@ commit/push again on your own initiative, only when asked.
     sign it may be worth restyling to look more obviously *interactive*
     — e.g. an input-like border or cursor affordance — next session,
     without losing the high-contrast legibility).
-- `backend/` — Python package `ispf_backend`, pure prefix-command
-  semantics, no VS Code awareness. `prefix_commands.py`'s module
-  docstring documents the full supported command grammar and validation
-  rules, including LABEL (`.name`/`.`), EXCLUDE (`x[n]`/`xx`...`xx`, both
-  added 2026-09-12), and SHIFT (`)`/`((`/`>`/`<<`/etc., added
-  2026-09-13). `pytest backend/tests/` — 65 tests, all passing, covers
-  single and block delete/repeat/insert/copy/move including move-up
-  (destination line above the source), every documented error case,
-  LABEL set/clear/reassign/reserved-name/case-folding/duplicate-in-batch,
-  EXCLUDE set/count/block/unmatched/accumulate, and SHIFT
-  right/left/explicit-count/angle-bracket-aliases/truncation, all plus
-  remapping through every restructuring op where applicable. This is
-  the trustworthy, already-verified layer; the webview/gutter wiring is
-  the layer still
+- `backend/` — Python package `ispf_backend`, no VS Code awareness, and
+  pure/side-effect-free EXCEPT for the CUT/PASTE clipboard (see the
+  2026-09-13 status entry for why that one had to be genuine module
+  state). `prefix_commands.py`'s module docstring documents the full
+  supported command grammar and validation rules, including LABEL
+  (`.name`/`.`), EXCLUDE (`x[n]`/`xx`...`xx`), SHIFT (`)`/`((`/`>`/`<<`/
+  etc.), `RR`...`RR` block repeat, `UC`/`LC` case conversion, and the
+  2026-09-14 `pending_mark`/`execute_cut`/`execute_paste` design: an
+  unpaired `c[n]`/`cc`/`m[n]`/`mm` becomes a pending copy/move mark
+  (paired ones are unaffected, unchanged in-file copy/move), resolved by
+  the `CUT`/`PASTE` **primary** commands via `process()`'s
+  `execute_cut`/`execute_paste` flags — `prefix_commands.py` itself never
+  parses the words `cut`/`paste`, those only exist in
+  `primaryCommand.ts` now. `pytest backend/tests/` — **94 tests, all
+  passing**, covers single and block delete/repeat/insert/copy/move
+  including move-up (destination line above the source), every
+  documented error case, LABEL set/clear/reassign/reserved-name/case-
+  folding/duplicate-in-batch, EXCLUDE set/count/block/unmatched/
+  accumulate, SHIFT right/left/explicit-count/angle-bracket-aliases/
+  truncation, RR default/opening-count/closing-count/unmatched, UC/LC
+  single/range/too-many-markers/case-insensitivity, and the
+  pending-mark/CUT/PASTE design (mark creation single/block/copy/move,
+  setting-while-pending is an error, remapping through same-batch and
+  later-batch restructuring, dropped when its line is deleted,
+  execute_cut both mark kinds and its no-mark error, execute_paste
+  after/before/empty-clipboard-error/non-consuming, and
+  cut-in-one-document-then-paste-in-another), all plus remapping through
+  every restructuring op where applicable. This is the trustworthy,
+  already-verified layer; the webview/gutter wiring is the layer still
   under manual test.
 
 ## Build / package / install (what "run it" actually means right now)
@@ -556,6 +896,83 @@ real file in the installed extension:
   prefix command there, and confirm the view stays on that page instead
   of jumping to the top; try it also on a command that changes the line
   count (e.g. `d`/`i2`) to make sure the fix doesn't regress those.
+- LOCATE by line number (new 2026-09-13, entirely unexercised): `LOCATE
+  50`/`LOC 50`/`L 50` moves to line 50 and reveals it at the top;
+  `LOCATE 99999` (past EOF) errors; `LOCATE .a` (label) still works
+  alongside it.
+- RR block repeat (new 2026-09-13, entirely unexercised): `rr`...`rr`
+  repeats the marked block once; `rr3`...`rr` and `rr`...`rr3` both
+  repeat it 3 times (count on either marker); unmatched `rr` errors and
+  rejects the batch; a label on a line inside the original block stays
+  put.
+- UC/LC case conversion (new 2026-09-13, entirely unexercised): `uc`
+  uppercases one line, `lc` lowercases one line; `uc` on two separate
+  lines converts the whole range between them; `uc` on three or more
+  lines in one batch errors as ambiguous; a label on a converted line is
+  unaffected.
+- CUT/PASTE + pending mark (redesigned 2026-09-14, entirely unexercised
+  in this corrected shape — see that status entry for the full spec):
+  type `m` on a line (or `mm`...`mm` on a block) with no `a`/`b` paired
+  to it, then run the `CUT` primary command — the line(s) should
+  disappear from the document (moved to the clipboard); do the same with
+  `c`/`cc` instead — the line(s) should stay in place (copied, not
+  removed) after `CUT`. Move the cursor to a target line and run `PASTE`
+  (defaults to after) and `PASTE B` (before) and confirm placement.
+  Cut in ONE open ISPF file and paste into a DIFFERENT open ISPF file —
+  this is the whole point of the process-wide clipboard design, so it's
+  the most important case to verify. Paste twice in a row to confirm the
+  clipboard isn't consumed. `CUT` with nothing marked should error
+  ("nothing marked for cut"); `PASTE` with an empty clipboard should
+  error ("clipboard is empty"). Setting a second mark (e.g. `c` on
+  another line) while one is already pending, without running `CUT` in
+  between, should error ("already pending — use CUT first") and reject
+  that batch. A lone `a`/`b` with no mark pending should still be an
+  ordinary error, same as always. Paired `c`+`a`, `m`+`b`, `cc`+`a`/`b`,
+  `mm`+`a`/`b` should behave exactly as before this feature existed
+  (immediate in-file copy/move, no clipboard involvement) — confirm this
+  didn't regress. An unmatched `cc`/`mm` block should still error.
+- HOME key jumps to COMMAND ===> (new 2026-09-14, entirely unexercised):
+  pressing Home with the cursor already at the very start of the
+  document (line 1, column 1) in the main editor should jump focus to
+  the command bar and select its contents; Home anywhere else in the
+  document should behave completely normally (line-start/smart-home,
+  unchanged); Home inside any gutter prefix-command cell should always
+  jump to the command bar regardless of cursor position within that
+  cell.
+- FIND/CHANGE PREV + CHANGE FIRST/LAST (new 2026-09-13, entirely
+  unexercised): `find text prev` searches backward from the cursor and
+  wraps; after `find text prev`, a bare `find`/`rfind` should keep
+  searching backward (not flip to forward); `change old new first` and
+  `change old new last` change the first/last occurrence in the file
+  regardless of cursor position; `change old new prev` changes backward.
+- SORT (new 2026-09-13, entirely unexercised): `sort` alone sorts every
+  line as plain text; `sort 10 20` sorts by columns 10-20; `sort 10 20 d`
+  sorts descending; confirm it's a real, undoable document edit (Ctrl+Z
+  should revert it) and that any labels/excluded lines present before
+  the sort are gone afterward (expected — see README's "Known
+  limitations").
+- HX line command (new 2026-09-13, entirely unexercised): `hx` on a line
+  shows two hex rows underneath it, roughly aligned column-for-column
+  with the source characters (check this looks right visually — it's
+  CSS-font-based alignment, not guaranteed pixel-perfect, per
+  hexView.ts's docs); typing `hx` again on that same line hides it;
+  `hx3` shows hex for 3 consecutive lines at once; typing directly into
+  Monaco (or committing any prefix-command batch) while hex rows are
+  showing should make them all disappear; try it on a line with
+  non-ASCII characters to see what the "masked to one byte" hex actually
+  looks like (documented as not real UTF-8, just a peek).
+- FIND/CHANGE column-range restriction (new 2026-09-14, entirely
+  unexercised): `f 'xxx' 8 10` only finds `xxx` where it lies entirely
+  within columns 8-10, ignoring occurrences elsewhere on the line;
+  `change old new 8 10` likewise only replaces a match inside that
+  column range; combine with a scope (`f 'xxx' 8 10 all`, `c old new 8
+  10 last`) and confirm both the column AND scope restriction apply
+  together; a bare `find`/`rfind` repeat after a column-restricted FIND
+  should keep honoring that same column range; `find 100 200` (no
+  quotes, exactly two tokens) should be read as a literal two-word
+  search, NOT misinterpreted as a column-only command with an empty
+  search string; quoting a numeric search string (`find '100' 8 10`)
+  should let it combine with a real column range.
 
 ## Conventions
 

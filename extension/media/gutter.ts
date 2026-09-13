@@ -10,10 +10,31 @@ export interface PrefixErrorMsg {
   message: string;
 }
 
+export interface HexToggle {
+  line: number;
+  count: number;
+}
+
 interface GutterOptions {
   width: number;
   onCommit: (commands: PrefixCommand[]) => void;
+  // `hx`/`hx[n]` never reach the backend — see commit()'s interception
+  // and hexView.ts's class doc comment for why. `count` is only ever >1
+  // for the counted form (`hx3`); the caller treats that as "show" for
+  // each of the n lines, and a bare `hx` (count 1) as "toggle".
+  onHexToggle: (toggles: HexToggle[]) => void;
+  // HOME in a gutter cell jumps to the COMMAND ===> bar (see main.ts's
+  // jumpToCommandBar) — ISPF/3270's "Home goes to the first input field"
+  // convention. Unconditional (no "already at start of this cell" guard
+  // the way the main editor's Home interception has one): a gutter
+  // cell's own "move caret to position 0" behavior is negligible for a
+  // 1-9 character prefix command.
+  onJumpToCommandBar: () => void;
 }
+
+// Intercepted in commit() below, before a batch would otherwise be sent
+// to the backend as a set of (mostly unknown-command) prefix commands.
+const HEX_CODE_RE = /^hx(\d*)$/i;
 
 /**
  * A viewport-synced, editable prefix-command column drawn as a plain DOM
@@ -199,6 +220,9 @@ export class PrefixGutter {
       if (e.key === "Enter") {
         e.preventDefault();
         this.commit();
+      } else if (e.key === "Home") {
+        e.preventDefault();
+        this.options.onJumpToCommandBar();
       }
     });
     return input;
@@ -206,9 +230,24 @@ export class PrefixGutter {
 
   private commit(): void {
     const commands: PrefixCommand[] = [];
+    const hexToggles: HexToggle[] = [];
+    const hexLines: number[] = [];
     for (const [line, code] of this.pendingValues) {
-      if (code.trim()) commands.push({ line, code });
+      const trimmed = code.trim();
+      if (!trimmed) continue;
+      const hexMatch = HEX_CODE_RE.exec(trimmed);
+      if (hexMatch) {
+        hexToggles.push({ line, count: hexMatch[1] ? parseInt(hexMatch[1], 10) : 1 });
+        hexLines.push(line);
+        continue;
+      }
+      commands.push({ line, code: trimmed });
     }
+    // hx is consumed locally right away (see HexView) — it never goes
+    // through the backend, so there's no "consumedLines" round trip to
+    // wait for before clearing its cell.
+    if (hexLines.length > 0) this.clearLines(hexLines);
+    if (hexToggles.length > 0) this.options.onHexToggle(hexToggles);
     if (commands.length === 0) return;
     this.options.onCommit(commands);
   }

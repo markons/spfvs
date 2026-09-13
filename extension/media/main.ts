@@ -18,11 +18,13 @@ import "monaco-editor/esm/vs/basic-languages/ini/ini.contribution";
 import "monaco-editor/esm/vs/basic-languages/java/java.contribution";
 import "monaco-editor/esm/vs/basic-languages/cpp/cpp.contribution";
 import { registerPliLanguage } from "./pliLanguage";
-import { PrefixGutter, PrefixCommand } from "./gutter";
+import { PrefixGutter, PrefixCommand, HexToggle } from "./gutter";
 import { executePrimaryCommand } from "./primaryCommand";
 import { ensureExcludeFoldingProviderRegistered, linesToRanges, setExcludedRanges } from "./excludeFolding";
+import { HexView } from "./hexView";
 import "./gutter.css";
 import "./commandBar.css";
+import "./hexView.css";
 
 const vscodeApi = acquireVsCodeApi();
 
@@ -48,7 +50,7 @@ commandInput.className = "ispf-command-input";
 commandInput.autocomplete = "off";
 commandInput.spellcheck = false;
 commandInput.disabled = true;
-commandInput.placeholder = "find/f [first|last|all], rfind/rf, change/c, top, bottom, locate/loc/l .label, exclude/x, reset/res [lab], undo, save, cancel/can, end/pf3";
+commandInput.placeholder = "find/f [c1 c2] [first|last|prev|all], rfind/rf, change/c [c1 c2] [scope], sort [c1 c2] [a|d], cut, paste [a|b], top, bottom, locate/loc/l .label|line, exclude/x, reset/res [lab], undo, save, cancel/can, end/pf3";
 const commandMessage = document.createElement("span");
 commandMessage.className = "ispf-command-message";
 commandBar.appendChild(commandLabel);
@@ -88,7 +90,16 @@ function detectLanguage(fileName: string): string {
 
 let editor: monaco.editor.IStandaloneCodeEditor | undefined;
 let gutter: PrefixGutter | undefined;
+let hexView: HexView | undefined;
 let applyingRemoteChange = false;
+
+/** Focuses and selects the COMMAND ===> input, so whatever's typed next
+ * replaces it outright — matches how a 3270/ISPF command line behaves
+ * when you jump to it (HOME, or an empty one waiting for input). */
+function jumpToCommandBar(): void {
+  commandInput.focus();
+  commandInput.select();
+}
 
 function boot(text: string, fileName: string): void {
   const language = detectLanguage(fileName);
@@ -118,11 +129,41 @@ function boot(text: string, fileName: string): void {
     vscodeApi.postMessage({ type: "edit", changes });
   });
 
+  // ISPF/3270 convention: HOME jumps straight to the command line, the
+  // first input field on the screen. Only intercepted when it wouldn't
+  // otherwise do anything (cursor already at {1,1}, no modifier held) —
+  // Monaco's own Home (line-start / smart-home) is far too useful during
+  // normal editing to override everywhere the cursor happens to be.
+  editor.onKeyDown((e) => {
+    if (e.keyCode !== monaco.KeyCode.Home || e.shiftKey || e.ctrlKey || e.altKey || e.metaKey) return;
+    const pos = editor?.getPosition();
+    if (pos && pos.lineNumber === 1 && pos.column === 1) {
+      e.preventDefault();
+      e.stopPropagation();
+      jumpToCommandBar();
+    }
+  });
+
+  hexView = new HexView(editor, monaco);
+  const hexViewForCallback = hexView;
   gutter = new PrefixGutter(editor, monaco, editorRow, {
     width: GUTTER_WIDTH,
     onCommit: (commands: PrefixCommand[]) => {
       vscodeApi.postMessage({ type: "processPrefixCommands", commands });
     },
+    onHexToggle: (toggles: HexToggle[]) => {
+      for (const { line, count } of toggles) {
+        if (count > 1) {
+          for (let l = line; l < line + count; l++) hexViewForCallback.show(l);
+        } else {
+          hexViewForCallback.toggle(line);
+        }
+      }
+    },
+    // Home in a gutter cell always jumps — unlike the main editor, a
+    // gutter cell's own "move caret to start of typed text" behavior has
+    // negligible value for a 1-9 character prefix command.
+    onJumpToCommandBar: jumpToCommandBar,
   });
 
   // automaticLayout's ResizeObserver reacts to editorHost's size changing,
@@ -151,7 +192,11 @@ commandInput.addEventListener("keydown", (e) => {
   };
   void executePrimaryCommand(currentEditor, rawCommand, resolveLabel, notifyExcludedLinesChanged).then((outcome) => {
     if (outcome.kind === "forward") {
-      vscodeApi.postMessage({ type: "primaryAction", action: outcome.action });
+      // Spread everything but `kind` — PASTE's outcome carries extra
+      // `line`/`before` fields the extension host needs; every other
+      // forwarded action is just `{action}`.
+      const { kind: _kind, ...payload } = outcome;
+      vscodeApi.postMessage({ type: "primaryAction", ...payload });
       commandMessage.textContent = "";
       commandMessage.classList.remove("ispf-command-error");
       return;

@@ -6,18 +6,28 @@ framing is simpler than pulling in a JSON-RPC dependency. One JSON object
 per line in both directions.
 
 Request:  {"id": <any>, "lines": [str, ...], "commands": [{"line": int, "code": str}, ...],
-           "labels": {name: line, ...}, "excludedLines": [int, ...]}
+           "labels": {name: line, ...}, "excludedLines": [int, ...],
+           "pendingMark": {"kind": "copy"|"move", "start": int, "end": int} | null,
+           "executeCut": bool, "executePaste": {"line": int, "before": bool} | null}
 Response: {"id": <same>, "errors": [{"line": int, "message": str}, ...],
            "plan": {"lines": [str, ...], "consumedLines": [int, ...]} | null,
-           "labels": {name: line, ...} | null, "excludedLines": [int, ...] | null}
+           "labels": {name: line, ...} | null, "excludedLines": [int, ...] | null,
+           "pendingMark": {"kind": "copy"|"move", "start": int, "end": int} | null}
 
-`labels` is the caller-owned name->line label map, and `excludedLines` the
-caller-owned sorted list of hidden line numbers (see prefix_commands.py's
-module docstring for LABEL/EXCLUDE semantics): the caller sends its current
-value for each in every request and gets back both updated for that
-batch's restructuring plus whatever `.name`/`.`/`x`/`xx` ops were in it. On
-a rejected batch (`plan` is null) both are also null — the caller's values
-are unaffected and it should keep what it already had.
+`labels`/`excludedLines`/`pendingMark` are caller-owned state (see
+prefix_commands.py's module docstring for LABEL/EXCLUDE/CUT-PASTE
+semantics): the caller sends its current value for each in every request
+and gets each back updated for that batch's restructuring plus whatever
+`.name`/`.`/`x`/`xx`/unpaired-c-cc-m-mm ops were in it. On a rejected
+batch (`plan` is null) all three are also null — the caller's values are
+unaffected and it should keep what it already had. `executeCut` and
+`executePaste` are one-shot triggers (not caller-owned state to round-trip
+back) sent by the extension host in response to the CUT/PASTE *primary*
+commands — see prefix_commands.py's docstring for what each does; a
+request with neither set (and no `commands`) is just "give me the
+document back unchanged, but still report current labels/excludedLines/
+pendingMark", which the extension host doesn't currently have a reason to
+send but which falls out naturally from every field being optional.
 """
 from __future__ import annotations
 
@@ -35,10 +45,20 @@ def _handle(request: dict) -> dict:
         commands = [Command(line=c["line"], code=c["code"]) for c in request.get("commands", [])]
         labels = request.get("labels") or {}
         excluded_lines = request.get("excludedLines") or []
+        pending_mark = request.get("pendingMark")
+        execute_cut = bool(request.get("executeCut"))
+        execute_paste = request.get("executePaste")
     except (KeyError, TypeError) as e:
-        return {"id": req_id, "errors": [{"line": 0, "message": f"malformed request: {e}"}], "plan": None, "labels": None, "excludedLines": None}
+        return {
+            "id": req_id,
+            "errors": [{"line": 0, "message": f"malformed request: {e}"}],
+            "plan": None,
+            "labels": None,
+            "excludedLines": None,
+            "pendingMark": None,
+        }
 
-    result = process(lines, commands, labels, excluded_lines)
+    result = process(lines, commands, labels, excluded_lines, pending_mark, execute_cut, execute_paste)
     if result.errors:
         return {
             "id": req_id,
@@ -46,6 +66,7 @@ def _handle(request: dict) -> dict:
             "plan": None,
             "labels": None,
             "excludedLines": None,
+            "pendingMark": None,
         }
     plan = result.plan
     return {
@@ -54,6 +75,7 @@ def _handle(request: dict) -> dict:
         "plan": {"lines": plan.lines, "consumedLines": plan.consumed_lines},
         "labels": result.labels,
         "excludedLines": result.excluded_lines,
+        "pendingMark": result.pending_mark,
     }
 
 

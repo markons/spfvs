@@ -1,6 +1,6 @@
 import * as vscode from "vscode";
 import * as path from "path";
-import { BackendClient, RawCommand } from "./backendClient";
+import { BackendClient, BackendResponse, PendingMark, RawCommand } from "./backendClient";
 
 interface MonacoChange {
   startLine: number;
@@ -53,15 +53,22 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
     };
     webviewPanel.webview.html = this.getHtml(webviewPanel.webview, document);
 
-    // LABEL (.name) and EXCLUDE (x/xx) state for this document's edit
-    // session — see the module docstring on
-    // backend/ispf_backend/prefix_commands.py. Kept here (not on `this`)
-    // so it's naturally scoped to this one editor tab/document rather
-    // than shared across every open ISPF editor the way `this.appliedByUs`
-    // currently is. An external change invalidates both (they're tracked
-    // purely by line number), so neither needs to survive one.
+    // LABEL (.name), EXCLUDE (x/xx), and pending copy/move mark (unpaired
+    // c/cc/m/mm, resolved by CUT) state for this document's edit session
+    // — see the module docstring on backend/ispf_backend/prefix_commands.py.
+    // Kept here (not on `this`) so it's naturally scoped to this one
+    // editor tab/document rather than shared across every open ISPF
+    // editor the way `this.appliedByUs` currently is. An external change
+    // invalidates all three (they're tracked purely by line number), so
+    // none needs to survive one. `pendingMark` has no webview-visible
+    // display counterpart (unlike labels/excludedLines) — it's tracked
+    // here purely so it round-trips correctly through the backend across
+    // separate calls (a gutter batch that sets it, then later a CUT
+    // primary command that resolves it, possibly with unrelated batches
+    // shifting its lines around in between).
     let labels: Record<string, number> = {};
     let excludedLines: number[] = [];
+    let pendingMark: PendingMark | null = null;
     // Document versions produced by our OWN prefix-command batch, where
     // handlePrefixCommands has already updated `labels`/`excludedLines` to
     // the backend's post-batch values before applying the edit (same
@@ -76,11 +83,14 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
       if (e.document.uri.toString() !== document.uri.toString()) return;
 
       if (pendingBatchEditVersions.delete(e.document.version)) {
-        // Our own prefix-command batch: handlePrefixCommands already
-        // updated `labels`/`excludedLines` to the backend's post-batch
-        // (correctly remapped) values before applying this edit. Still
-        // need to push the new text — it came from the backend, not from
-        // Monaco, so the webview's model doesn't have it yet.
+        // Our own backend-driven edit — either a gutter prefix-command
+        // batch (handlePrefixCommands) or a CUT/PASTE primary action
+        // (handleClipboardAction) — already updated
+        // `labels`/`excludedLines`/`pendingMark` to the backend's
+        // post-batch (correctly remapped) values before applying this
+        // edit. Still need to push the new text — it came from the
+        // backend, not from Monaco, so the webview's model doesn't have
+        // it yet.
         webviewPanel.webview.postMessage({ type: "setContent", text: e.document.getText(), labels, excludedLines });
         return;
       }
@@ -88,11 +98,15 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
         this.appliedByUs.delete(e.document.version);
         // An ordinary Monaco-typed edit: the webview's model already has
         // this text, so no setContent needed. But such an edit isn't run
-        // through our line-remapping logic (that only happens for a
-        // prefix-command batch, above), so any existing label or excluded
-        // line could now silently point at the wrong line — safer to drop
-        // both than risk that. Only bother notifying the webview if there
-        // was anything to drop.
+        // through our line-remapping logic (that only happens for our own
+        // backend-driven edits, above), so any existing label, excluded
+        // line, or pending mark could now silently point at the wrong
+        // line — safer to drop all three than risk that. pendingMark has
+        // no webview-visible display, so it's always just reset silently;
+        // labels/excludedLines only trigger a message if there was
+        // actually something visible to drop (avoids a pointless
+        // fold/unfold no-op when pendingMark was the only thing set).
+        pendingMark = null;
         if (Object.keys(labels).length > 0 || excludedLines.length > 0) {
           labels = {};
           excludedLines = [];
@@ -102,9 +116,11 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
       }
       // A genuine external change (undo/redo, another editor, git, ...) —
       // force the webview's Monaco model back in sync, and drop labels/
-      // excluded lines for the same reason as the ordinary-edit case above.
+      // excluded lines/pending mark for the same reason as the
+      // ordinary-edit case above.
       labels = {};
       excludedLines = [];
+      pendingMark = null;
       webviewPanel.webview.postMessage({ type: "setContent", text: e.document.getText(), labels, excludedLines });
     });
     webviewPanel.onDidDispose(() => changeSub.dispose());
@@ -128,17 +144,38 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
             message.commands as RawCommand[],
             labels,
             excludedLines,
-            (updatedLabels, updatedExcludedLines, expectedVersion) => {
+            pendingMark,
+            (updatedLabels, updatedExcludedLines, updatedPendingMark, expectedVersion) => {
               labels = updatedLabels;
               excludedLines = updatedExcludedLines;
+              pendingMark = updatedPendingMark;
               pendingBatchEditVersions.add(expectedVersion);
             }
           );
           break;
         case "primaryAction":
-          await this.handlePrimaryAction(document, webviewPanel, message.action as string, () => {
-            labels = {};
-          });
+          if (message.action === "cut" || message.action === "paste") {
+            await this.handleClipboardAction(
+              document,
+              webviewPanel,
+              message.action,
+              labels,
+              excludedLines,
+              pendingMark,
+              message.line as number | undefined,
+              message.before as boolean | undefined,
+              (updatedLabels, updatedExcludedLines, updatedPendingMark, expectedVersion) => {
+                labels = updatedLabels;
+                excludedLines = updatedExcludedLines;
+                pendingMark = updatedPendingMark;
+                if (expectedVersion !== null) pendingBatchEditVersions.add(expectedVersion);
+              }
+            );
+          } else {
+            await this.handlePrimaryAction(document, webviewPanel, message.action as string, () => {
+              labels = {};
+            });
+          }
           break;
         case "excludedLinesChanged":
           // Fire-and-forget notification from the webview's own EXCLUDE/
@@ -242,22 +279,28 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
   }
 
   /** `onStateResolved` is invoked with the batch's updated labels/
-   * excludedLines and the document version the resulting edit is expected
-   * to produce, BEFORE the edit is applied — see `pendingBatchEditVersions`
-   * above for why. */
+   * excludedLines/pendingMark and the document version the resulting edit
+   * is expected to produce, BEFORE the edit is applied — see
+   * `pendingBatchEditVersions` above for why. */
   private async handlePrefixCommands(
     document: vscode.TextDocument,
     webviewPanel: vscode.WebviewPanel,
     commands: RawCommand[],
     labels: Record<string, number>,
     excludedLines: number[],
-    onStateResolved: (labels: Record<string, number>, excludedLines: number[], expectedDocVersion: number) => void
+    pendingMark: PendingMark | null,
+    onStateResolved: (
+      labels: Record<string, number>,
+      excludedLines: number[],
+      pendingMark: PendingMark | null,
+      expectedDocVersion: number
+    ) => void
   ): Promise<void> {
     const lines: string[] = [];
     for (let i = 0; i < document.lineCount; i++) {
       lines.push(document.lineAt(i).text);
     }
-    const response = await this.backend.processPrefixCommands(lines, commands, labels, excludedLines);
+    const response = await this.backend.processPrefixCommands(lines, commands, labels, excludedLines, pendingMark);
     if (response.errors.length > 0 || !response.plan) {
       webviewPanel.webview.postMessage({ type: "prefixResult", errors: response.errors, consumedLines: [] });
       return;
@@ -272,7 +315,7 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
     const fullRange = new vscode.Range(0, 0, document.lineCount, 0);
     const edit = new vscode.WorkspaceEdit();
     edit.replace(document.uri, fullRange, newText);
-    onStateResolved(response.labels ?? {}, response.excludedLines ?? [], document.version + 1);
+    onStateResolved(response.labels ?? {}, response.excludedLines ?? [], response.pendingMark ?? null, document.version + 1);
     // Deliberately NOT tracked via appliedByUs: unlike a webview-originated
     // "edit" message, Monaco's own model here does not yet have this text
     // (the new content came from the backend, not from something the user
@@ -287,6 +330,75 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
       consumedLines: response.plan.consumedLines,
       labels: response.labels,
       excludedLines: response.excludedLines,
+    });
+  }
+
+  /** CUT/PASTE primary commands (see prefix_commands.py's module
+   * docstring and gutter c/cc/m/mm's unpaired-mark behavior): both are
+   * resolved by the SAME backend `process()` used for gutter batches,
+   * just with an empty `commands` list and `executeCut`/`executePaste`
+   * set instead. CUT needs no extra payload (it resolves whatever
+   * `pendingMark` already is); PASTE needs the target `line` and
+   * `before`/after direction, which the webview computed from the
+   * cursor position when the primary command was typed. Reports success/
+   * failure via `primaryActionResult` (the command bar's message area),
+   * unlike gutter batches' per-line `prefixResult`. */
+  private async handleClipboardAction(
+    document: vscode.TextDocument,
+    webviewPanel: vscode.WebviewPanel,
+    action: "cut" | "paste",
+    labels: Record<string, number>,
+    excludedLines: number[],
+    pendingMark: PendingMark | null,
+    line: number | undefined,
+    before: boolean | undefined,
+    onStateResolved: (
+      labels: Record<string, number>,
+      excludedLines: number[],
+      pendingMark: PendingMark | null,
+      expectedDocVersion: number | null
+    ) => void
+  ): Promise<void> {
+    const lines: string[] = [];
+    for (let i = 0; i < document.lineCount; i++) {
+      lines.push(document.lineAt(i).text);
+    }
+    const executeCut = action === "cut";
+    const executePaste = action === "paste" && line !== undefined ? { line, before: !!before } : null;
+    const response: BackendResponse = await this.backend.processPrefixCommands(
+      lines,
+      [],
+      labels,
+      excludedLines,
+      pendingMark,
+      executeCut,
+      executePaste
+    );
+    if (response.errors.length > 0 || !response.plan) {
+      const message = response.errors[0]?.message ?? `${action} failed`;
+      webviewPanel.webview.postMessage({ type: "primaryActionResult", message, isError: true });
+      return;
+    }
+
+    const eol = document.eol === vscode.EndOfLine.CRLF ? "\r\n" : "\n";
+    const newText = response.plan.lines.join(eol);
+    if (newText === document.getText()) {
+      // A non-destructive clipboard COPY (from a "copy" pending mark)
+      // leaves the document byte-identical — skip the edit entirely
+      // rather than creating a no-op undo-stack entry / dirty flag for a
+      // change that never actually happened to this document.
+      onStateResolved(response.labels ?? {}, response.excludedLines ?? [], response.pendingMark ?? null, null);
+    } else {
+      const fullRange = new vscode.Range(0, 0, document.lineCount, 0);
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(document.uri, fullRange, newText);
+      onStateResolved(response.labels ?? {}, response.excludedLines ?? [], response.pendingMark ?? null, document.version + 1);
+      await vscode.workspace.applyEdit(edit);
+    }
+
+    webviewPanel.webview.postMessage({
+      type: "primaryActionResult",
+      message: action === "cut" ? "cut to clipboard" : "pasted from clipboard",
     });
   }
 

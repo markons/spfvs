@@ -10,12 +10,18 @@ interface Handled {
  * command — those can only run in the extension host, so the caller must
  * forward them via postMessage. RESET LAB is also forwarded: labels are
  * extension-host-owned state (see ispfEditorProvider.ts), so clearing
- * them means the host, not just this webview's Monaco model. Everything
- * else (FIND/RFIND/CHANGE/TOP/BOTTOM/LOCATE/EXCLUDE/RESET) is resolved
- * entirely against Monaco's own model here. */
+ * them means the host, not just this webview's Monaco model. CUT/PASTE
+ * are forwarded too — they resolve a gutter-set pending copy/move mark
+ * (or, for PASTE, the clipboard) via the SAME backend `process()` used
+ * for gutter batches, which this webview has no direct line to (see
+ * prefix_commands.py's module docstring and ispfEditorProvider.ts's
+ * handleClipboardAction). Everything else (FIND/RFIND/CHANGE/SORT/TOP/
+ * BOTTOM/LOCATE/EXCLUDE/RESET) is resolved entirely against Monaco's own
+ * model here. */
 export type CommandOutcome =
   | ({ kind: "handled" } & Handled)
-  | { kind: "forward"; action: "undo" | "undoAll" | "cancel" | "save" | "end" | "resetLabels" };
+  | { kind: "forward"; action: "undo" | "undoAll" | "cancel" | "save" | "end" | "resetLabels" | "cut" }
+  | { kind: "forward"; action: "paste"; line: number; before: boolean };
 
 /** Notifies the extension host that the webview's own EXCLUDE/RESET just
  * changed which lines are hidden, so its excluded-lines state (kept in
@@ -74,14 +80,29 @@ async function revealAndUnexclude(
   notifyExcludedLinesChanged(remaining);
 }
 
+/** LOCATE accepts either a `.label` (resolved via `resolveLabel`) or a
+ * plain line number, e.g. `LOCATE 50` — real ISPF's own, arguably more
+ * commonly-used form, previously missing here entirely. */
 async function doLocate(
   editor: monacoNs.editor.IStandaloneCodeEditor,
+  model: monacoNs.editor.ITextModel,
   resolveLabel: LabelResolver,
   notifyExcludedLinesChanged: ExcludedLinesNotifier,
   token: string
 ): Promise<Handled> {
-  const line = resolveLabel(token);
-  if (line === undefined) return { message: `label '${token}' not found`, isError: true };
+  let line: number | undefined;
+  if (isLabelToken(token)) {
+    line = resolveLabel(token);
+    if (line === undefined) return { message: `label '${token}' not found`, isError: true };
+  } else {
+    const n = Number(token);
+    if (!Number.isInteger(n) || n < 1) {
+      return { message: "LOCATE requires a label or a line number, e.g. LOCATE .A or LOCATE 50", isError: true };
+    }
+    const totalLines = model.getLineCount();
+    if (n > totalLines) return { message: `line ${n} is out of range (document has ${totalLines} lines)`, isError: true };
+    line = n;
+  }
   await revealAndUnexclude(editor, notifyExcludedLinesChanged, [line]);
   editor.setPosition({ lineNumber: line, column: 1 });
   // revealRangeAtTop on a single-point range (Monaco has no revealLineAtTop
@@ -93,80 +114,170 @@ async function doLocate(
   return { message: `line ${line}` };
 }
 
-type FindScope = "next" | "first" | "last" | "all";
+type FindScope = "next" | "prev" | "first" | "last" | "all";
 
-/** Remembers the most recent FIND's search string, module-scoped like
- * excludeFolding.ts's `currentRanges` (one JS module instance per
- * webview, so this is naturally per-editor-session state) — backs both
- * a bare `FIND`/`F` with no arguments and the explicit `RFIND`/`RF`
- * command, ISPF's real PF5 "repeat find" equivalent. Set whenever a
- * non-empty needle is parsed, whether or not that search actually found
- * anything, so retrying after e.g. an edit still repeats the same text. */
+/** Remembers the most recent FIND's search string and direction,
+ * module-scoped like excludeFolding.ts's `currentRanges` (one JS module
+ * instance per webview, so this is naturally per-editor-session state) —
+ * backs both a bare `FIND`/`F` with no arguments and the explicit
+ * `RFIND`/`RF` command, ISPF's real PF5 "repeat find" equivalent. The
+ * needle is set whenever a non-empty one is parsed, whether or not that
+ * search actually found anything, so retrying after e.g. an edit still
+ * repeats the same text. The direction only updates for NEXT/PREV (an
+ * explicit direction to continue in) — FIRST/LAST/ALL are one-shot jumps,
+ * not something a repeat should try to redo, so they leave it alone. */
 let lastFindNeedle: string | null = null;
+let lastFindDirection: "next" | "prev" = "next";
+/** The column restriction (if any) from the last explicit FIND, reused by
+ * a bare FIND/RFIND repeat the same way the needle and direction are. */
+let lastFindColumnRange: ColumnRange = null;
 
-/** Splits a trailing FIRST/LAST/NEXT/ALL scope keyword off FIND's
- * argument list, the same way CHANGE already splits off a trailing ALL
- * (see doChange) — requiring at least one token before it so a literal
- * one-word search for e.g. "first" isn't misread as the scope keyword. */
-function extractFindScope(args: string[]): { needle: string; scope: FindScope } {
+/** Splits a trailing FIRST/LAST/NEXT/PREV/ALL scope keyword off the end
+ * of a command's argument list — shared by FIND and CHANGE, both of
+ * which support the same scopes — requiring at least one token before it
+ * so a literal one-word search for e.g. "first" isn't misread as the
+ * scope keyword. Returns the remaining args unjoined (FIND wants them
+ * joined into one needle; CHANGE wants old/new as separate tokens). */
+function extractTrailingScope(args: string[]): { rest: string[]; scope: FindScope } {
   let rest = args;
   let scope: FindScope = "next";
   if (rest.length > 1) {
     const last = rest[rest.length - 1].toLowerCase();
-    if (last === "all" || last === "first" || last === "last" || last === "next") {
+    if (last === "all" || last === "first" || last === "last" || last === "next" || last === "prev") {
       scope = last;
       rest = rest.slice(0, -1);
     }
   }
-  return { needle: rest.join(" "), scope };
+  return { rest, scope };
+}
+
+type ColumnRange = { start: number; end: number } | null;
+
+/** Extracts a trailing "c1 c2" column-range pair (1-indexed, inclusive)
+ * off the end of an args list — ISPF's own `FIND string c1 c2` /
+ * `CHANGE old new c1 c2` syntax (column limits come after the search
+ * text but before any FIRST/LAST/NEXT/PREV/ALL scope keyword, which the
+ * caller must already have stripped via `extractTrailingScope` before
+ * calling this). `minRemaining` is how many tokens must be left over
+ * AFTER removing the two column tokens (1 for FIND's needle, 2 for
+ * CHANGE's old+new) — without that check, an unquoted numeric search
+ * like `find 100 200` (no column restriction intended) would be
+ * misread as a column-only command with an empty needle. A quoted
+ * search string (`find '100' 8 10`) collapses to one token before this
+ * ever runs (see splitArgs), so quoting still disambiguates exactly the
+ * way it does in real ISPF. */
+function extractColumnRange(args: string[], minRemaining: number): { rest: string[]; range: ColumnRange } {
+  if (args.length - 2 < minRemaining) return { rest: args, range: null };
+  const [c1, c2] = args.slice(-2);
+  if (!/^\d+$/.test(c1) || !/^\d+$/.test(c2)) return { rest: args, range: null };
+  const start = Number(c1);
+  const end = Number(c2);
+  if (start < 1 || end < start) return { rest: args, range: null };
+  return { rest: args.slice(0, -2), range: { start, end } };
+}
+
+/** True if a match lies entirely within an (inclusive, 1-indexed) column
+ * range — `null` (no range given) always passes. `range.endColumn` is
+ * one PAST the last matched character (Monaco convention), so the last
+ * column actually used is `endColumn - 1`. */
+function withinColumnRange(range: monacoNs.Range, cols: ColumnRange): boolean {
+  if (!cols) return true;
+  return range.startColumn >= cols.start && range.endColumn - 1 <= cols.end;
+}
+
+function comparePositions(a: monacoNs.IPosition, b: monacoNs.IPosition): number {
+  return a.lineNumber !== b.lineNumber ? a.lineNumber - b.lineNumber : a.column - b.column;
+}
+
+/** Picks one match out of a column-filtered, document-order match list
+ * for the NEXT/PREV/FIRST/LAST scopes (ALL is handled separately by the
+ * caller, since it wants every match, not one). NEXT/PREV wrap around
+ * the document the same way Monaco's own findNextMatch/findPreviousMatch
+ * do when there's no column restriction to honor. */
+function pickMatch(
+  matches: monacoNs.editor.FindMatch[],
+  scope: Exclude<FindScope, "all">,
+  cursorPos: monacoNs.IPosition
+): monacoNs.editor.FindMatch | null {
+  if (matches.length === 0) return null;
+  if (scope === "first") return matches[0];
+  if (scope === "last") return matches[matches.length - 1];
+  if (scope === "prev") {
+    for (let i = matches.length - 1; i >= 0; i--) {
+      if (comparePositions(matches[i].range.getStartPosition(), cursorPos) < 0) return matches[i];
+    }
+    return matches[matches.length - 1];
+  }
+  return matches.find((m) => comparePositions(m.range.getStartPosition(), cursorPos) > 0) ?? matches[0];
 }
 
 /** FIND ALL needs to actually show every hit, not just report a count —
  * including ones sitting inside an EXCLUDEd/x'd region, which would
  * otherwise stay collapsed and invisible even after "found". FIRST/LAST
  * search from the very top/bottom of the file regardless of the cursor;
- * NEXT (the default, also what a bare FIND/RFIND repeats) searches
- * forward from the cursor and wraps, as before. */
+ * NEXT/PREV (the default, also what a bare FIND/RFIND repeats) search
+ * forward/backward from the cursor and wrap, as before.
+ *
+ * `cols` is ISPF's own column-restriction form (`FIND string c1 c2`) —
+ * only text lying entirely within columns c1-c2 counts as a match. When
+ * given, this bypasses Monaco's native findNextMatch/findPreviousMatch
+ * (which have no concept of column limits) in favor of pulling every
+ * raw match via findMatches and filtering/picking manually — see
+ * `withinColumnRange`/`pickMatch`. With no column restriction the
+ * original per-scope Monaco calls are used unchanged, to avoid any risk
+ * of the manual wrap-around logic subtly behaving differently from
+ * Monaco's own for the (by far more common) unrestricted case. */
 async function runFind(
   editor: monacoNs.editor.IStandaloneCodeEditor,
   model: monacoNs.editor.ITextModel,
   notifyExcludedLinesChanged: ExcludedLinesNotifier,
   needle: string,
-  scope: FindScope
+  scope: FindScope,
+  cols: ColumnRange = null
 ): Promise<Handled> {
+  const colSuffix = cols ? ` in columns ${cols.start}-${cols.end}` : "";
   if (scope === "all") {
-    const matches = model.findMatches(needle, true, false, false, null, false);
-    if (matches.length === 0) return { message: `'${needle}' not found`, isError: true };
+    let matches = model.findMatches(needle, true, false, false, null, false);
+    if (cols) matches = matches.filter((m) => withinColumnRange(m.range, cols));
+    if (matches.length === 0) return { message: `'${needle}' not found${colSuffix}`, isError: true };
     await revealAndUnexclude(editor, notifyExcludedLinesChanged, matches.map((m) => m.range.startLineNumber));
     editor.setSelection(matches[0].range);
     editor.revealRangeAtTop(matches[0].range);
-    return { message: `${matches.length} occurrence(s) found` };
+    return { message: `${matches.length} occurrence(s) found${colSuffix}` };
   }
 
   let match: monacoNs.editor.FindMatch | null;
-  if (scope === "first") {
+  if (cols) {
+    const matches = model.findMatches(needle, true, false, false, null, false).filter((m) => withinColumnRange(m.range, cols));
+    const cursorPos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
+    match = pickMatch(matches, scope, cursorPos);
+  } else if (scope === "first") {
     match = model.findNextMatch(needle, { lineNumber: 1, column: 1 }, false, false, null, false);
   } else if (scope === "last") {
     const lastLine = model.getLineCount();
     match = model.findPreviousMatch(needle, { lineNumber: lastLine, column: model.getLineMaxColumn(lastLine) }, false, false, null, false);
+  } else if (scope === "prev") {
+    const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
+    match = model.findPreviousMatch(needle, pos, false, false, null, false);
   } else {
     const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
     match = model.findNextMatch(needle, pos, false, false, null, false);
   }
-  if (!match) return { message: `'${needle}' not found`, isError: true };
+  if (!match) return { message: `'${needle}' not found${colSuffix}`, isError: true };
   await revealAndUnexclude(editor, notifyExcludedLinesChanged, [match.range.startLineNumber]);
   editor.setSelection(match.range);
   // revealRangeAtTop (not revealRangeInCenter): matches ISPF's own FIND,
   // which always scrolls the found line to the top of the screen rather
   // than centering it.
   editor.revealRangeAtTop(match.range);
-  return { message: scope === "next" ? `found '${needle}'` : `found '${needle}' (${scope})` };
+  return { message: scope === "next" ? `found '${needle}'${colSuffix}` : `found '${needle}' (${scope})${colSuffix}` };
 }
 
 /** `FIND`/`F` with no arguments at all, or the explicit `RFIND`/`RF`
- * command, repeat the last search — ISPF's real "repeat find" is PF5/
- * RFIND; a bare FIND is this project's own shortcut for the same thing,
- * since there's no PF5 key to bind in a text command bar. */
+ * command, repeat the last search in the same direction it last searched
+ * — ISPF's real "repeat find" is PF5/RFIND; a bare FIND is this
+ * project's own shortcut for the same thing, since there's no PF5 key to
+ * bind in a text command bar. */
 async function doFind(
   editor: monacoNs.editor.IStandaloneCodeEditor,
   model: monacoNs.editor.ITextModel,
@@ -175,37 +286,111 @@ async function doFind(
 ): Promise<Handled> {
   if (args.length === 0) {
     if (lastFindNeedle === null) return { message: "FIND requires a search string", isError: true };
-    return runFind(editor, model, notifyExcludedLinesChanged, lastFindNeedle, "next");
+    return runFind(editor, model, notifyExcludedLinesChanged, lastFindNeedle, lastFindDirection, lastFindColumnRange);
   }
-  const { needle, scope } = extractFindScope(args);
+  const { rest: afterScope, scope } = extractTrailingScope(args);
+  const { rest, range: cols } = extractColumnRange(afterScope, 1);
+  const needle = rest.join(" ");
   if (!needle) return { message: "FIND requires a search string", isError: true };
   lastFindNeedle = needle;
-  return runFind(editor, model, notifyExcludedLinesChanged, needle, scope);
+  lastFindColumnRange = cols;
+  if (scope === "next" || scope === "prev") lastFindDirection = scope;
+  return runFind(editor, model, notifyExcludedLinesChanged, needle, scope, cols);
 }
 
-function doChange(editor: monacoNs.editor.IStandaloneCodeEditor, model: monacoNs.editor.ITextModel, args: string[]): Handled {
+/** `cols` is the same ISPF column-restriction form FIND supports
+ * (`CHANGE old new c1 c2`) — see runFind's doc comment for why the
+ * column-restricted path recomputes matches via findMatches/pickMatch
+ * instead of Monaco's native findNextMatch/findPreviousMatch. */
+function doChange(
+  editor: monacoNs.editor.IStandaloneCodeEditor,
+  model: monacoNs.editor.ITextModel,
+  args: string[]
+): Handled {
   if (args.length < 2) return { message: "CHANGE requires old and new text", isError: true };
-  let rest = args;
-  let all = false;
-  if (rest[rest.length - 1]?.toLowerCase() === "all") {
-    all = true;
-    rest = rest.slice(0, -1);
-  }
+  const { rest: afterScope, scope } = extractTrailingScope(args);
+  const { rest, range: cols } = extractColumnRange(afterScope, 2);
+  if (rest.length < 2) return { message: "CHANGE requires old and new text", isError: true };
+  if (rest.length > 2) return { message: "CHANGE takes at most old text, new text, and a column range", isError: true };
   const [oldText, newText] = rest;
-  if (all) {
-    const matches = model.findMatches(oldText, true, false, false, null, false);
-    if (matches.length === 0) return { message: `'${oldText}' not found`, isError: true };
+  const colSuffix = cols ? ` in columns ${cols.start}-${cols.end}` : "";
+  if (scope === "all") {
+    let matches = model.findMatches(oldText, true, false, false, null, false);
+    if (cols) matches = matches.filter((m) => withinColumnRange(m.range, cols));
+    if (matches.length === 0) return { message: `'${oldText}' not found${colSuffix}`, isError: true };
     editor.executeEdits(
       "ispf-primary-command",
       matches.map((m) => ({ range: m.range, text: newText }))
     );
-    return { message: `${matches.length} occurrence(s) changed` };
+    return { message: `${matches.length} occurrence(s) changed${colSuffix}` };
   }
-  const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
-  const match = model.findNextMatch(oldText, pos, false, false, null, false);
-  if (!match) return { message: `'${oldText}' not found`, isError: true };
+  let match: monacoNs.editor.FindMatch | null;
+  if (cols) {
+    const matches = model.findMatches(oldText, true, false, false, null, false).filter((m) => withinColumnRange(m.range, cols));
+    const cursorPos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
+    match = pickMatch(matches, scope, cursorPos);
+  } else if (scope === "first") {
+    match = model.findNextMatch(oldText, { lineNumber: 1, column: 1 }, false, false, null, false);
+  } else if (scope === "last") {
+    const lastLine = model.getLineCount();
+    match = model.findPreviousMatch(oldText, { lineNumber: lastLine, column: model.getLineMaxColumn(lastLine) }, false, false, null, false);
+  } else if (scope === "prev") {
+    const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
+    match = model.findPreviousMatch(oldText, pos, false, false, null, false);
+  } else {
+    const pos = editor.getPosition() ?? { lineNumber: 1, column: 1 };
+    match = model.findNextMatch(oldText, pos, false, false, null, false);
+  }
+  if (!match) return { message: `'${oldText}' not found${colSuffix}`, isError: true };
   editor.executeEdits("ispf-primary-command", [{ range: match.range, text: newText }]);
-  return { message: "1 occurrence changed" };
+  return { message: scope === "next" ? `1 occurrence changed${colSuffix}` : `1 occurrence changed (${scope})${colSuffix}` };
+}
+
+/** SORT reorders every line in the file — a deliberate MVP
+ * simplification vs. real ISPF, which sorts only the currently-displayed
+ * (non-excluded) lines and leaves excluded ones fixed in place; this
+ * project sorts the whole file regardless of exclusion state, which is
+ * far simpler than interleaving hidden lines back into a sorted result.
+ * Goes through `editor.executeEdits` (a plain document edit) rather than
+ * the prefix-command backend, so it naturally flows through the same
+ * "ordinary Monaco edit" path that already drops LABELs/excluded-lines
+ * on any edit it can't remap (see ispfEditorProvider.ts) — appropriate
+ * here, since a full-file sort makes old line-number-based state
+ * meaningless anyway. `SORT` alone sorts whole lines ascending; `SORT
+ * <start> <end>` sorts by the column range (1-indexed, inclusive)
+ * instead; append `D` (descending) or `A` (ascending, the default) in
+ * either form, in any position. */
+function doSort(editor: monacoNs.editor.IStandaloneCodeEditor, model: monacoNs.editor.ITextModel, args: string[]): Handled {
+  let descending = false;
+  const colArgs: number[] = [];
+  for (const arg of args) {
+    const lower = arg.toLowerCase();
+    if (lower === "d") descending = true;
+    else if (lower === "a") descending = false;
+    else if (/^\d+$/.test(arg)) colArgs.push(Number(arg));
+    else return { message: `SORT: unrecognized argument '${arg}'`, isError: true };
+  }
+  if (colArgs.length === 1) return { message: "SORT requires both a start and end column, e.g. SORT 10 20", isError: true };
+  if (colArgs.length > 2) return { message: "SORT takes at most a start and end column", isError: true };
+  const [colStart, colEnd] = colArgs;
+  if (colArgs.length === 2 && (colStart < 1 || colEnd < colStart)) {
+    return { message: `SORT: invalid column range ${colStart}-${colEnd}`, isError: true };
+  }
+
+  const totalLines = model.getLineCount();
+  const contents: string[] = [];
+  for (let i = 1; i <= totalLines; i++) contents.push(model.getLineContent(i));
+  const key = (line: string) => (colArgs.length === 2 ? line.slice(colStart - 1, colEnd) : line);
+  const order = contents.map((_, i) => i);
+  order.sort((a, b) => {
+    const ka = key(contents[a]);
+    const kb = key(contents[b]);
+    const cmp = ka < kb ? -1 : ka > kb ? 1 : 0;
+    return descending ? -cmp : cmp;
+  });
+  const sortedText = order.map((i) => contents[i]).join(model.getEOL());
+  editor.executeEdits("ispf-primary-command", [{ range: model.getFullModelRange(), text: sortedText }]);
+  return { message: `sorted ${totalLines} line(s)` };
 }
 
 /** EXCLUDE/X hides matching lines (or, with ALL, every line, or the range
@@ -302,8 +487,10 @@ export async function executePrimaryCommand(
     case "locate":
     case "loc":
     case "l":
-      if (!isLabelToken(rest[0])) return { kind: "handled", message: "LOCATE requires a label, e.g. LOCATE .A", isError: true };
-      return { kind: "handled", ...(await doLocate(editor, resolveLabel, notifyExcludedLinesChanged, rest[0])) };
+      if (rest[0] === undefined) {
+        return { kind: "handled", message: "LOCATE requires a label or a line number, e.g. LOCATE .A or LOCATE 50", isError: true };
+      }
+      return { kind: "handled", ...(await doLocate(editor, model, resolveLabel, notifyExcludedLinesChanged, rest[0])) };
     case "find":
     case "f":
       return { kind: "handled", ...(await doFind(editor, model, notifyExcludedLinesChanged, rest)) };
@@ -315,6 +502,29 @@ export async function executePrimaryCommand(
     case "change":
     case "c":
       return { kind: "handled", ...doChange(editor, model, rest) };
+    case "sort":
+      return { kind: "handled", ...doSort(editor, model, rest) };
+    case "cut":
+      // Resolves whatever c/cc/m/mm mark is currently pending in the
+      // extension host (see ispfEditorProvider.ts) — no operand needed
+      // or accepted, matching real ISPF's own CUT.
+      return { kind: "forward", action: "cut" };
+    case "paste": {
+      // Inserts the clipboard at the CURSOR's current line — this
+      // webview has no concept of "the selected line" beyond that, so
+      // unlike the old prefix `paste` word (removed) there's no way to
+      // target an arbitrary line without moving the cursor there first
+      // (e.g. via LOCATE). Optional trailing A (after, default) or B
+      // (before) picks the direction, same letters as the a/b prefix
+      // destination markers.
+      const pos = editor.getPosition();
+      if (!pos) return { kind: "handled", message: "no cursor position to paste at", isError: true };
+      const arg = rest[0]?.toLowerCase();
+      if (arg !== undefined && arg !== "a" && arg !== "b") {
+        return { kind: "handled", message: "PASTE takes an optional A (after, default) or B (before)", isError: true };
+      }
+      return { kind: "forward", action: "paste", line: pos.lineNumber, before: arg === "b" };
+    }
     case "exclude":
     case "x":
       return { kind: "handled", ...(await doExclude(editor, model, resolveLabel, notifyExcludedLinesChanged, rest)) };

@@ -1,16 +1,32 @@
+import pytest
+
+from ispf_backend import prefix_commands
 from ispf_backend.models import Command
 from ispf_backend.prefix_commands import process
+
+
+@pytest.fixture(autouse=True)
+def _reset_clipboard():
+    # The clipboard (cut/paste) is genuine module-level state, deliberately
+    # not reset by process() itself (see its docstring) — tests must not
+    # leak clipboard content between each other regardless of run order.
+    prefix_commands._clipboard = []
+    yield
+    prefix_commands._clipboard = []
 
 
 def cmd(line, code):
     return Command(line=line, code=code)
 
 
-def run(lines, commands, labels=None, excluded_lines=None):
-    return process(lines, [cmd(l, c) for l, c in commands], labels, excluded_lines)
+def run(lines, commands, labels=None, excluded_lines=None, pending_mark=None, execute_cut=False, execute_paste=None):
+    return process(
+        lines, [cmd(l, c) for l, c in commands], labels, excluded_lines,
+        pending_mark, execute_cut, execute_paste,
+    )
 
 
-def assert_ok(result, expected_lines, expected_consumed=None, expected_labels=None, expected_excluded=None):
+def assert_ok(result, expected_lines, expected_consumed=None, expected_labels=None, expected_excluded=None, expected_pending_mark="unset"):
     assert result.errors == [], result.errors
     assert result.plan is not None
     assert result.plan.lines == expected_lines
@@ -20,6 +36,8 @@ def assert_ok(result, expected_lines, expected_consumed=None, expected_labels=No
         assert result.labels == expected_labels
     if expected_excluded is not None:
         assert result.excluded_lines == sorted(expected_excluded)
+    if expected_pending_mark != "unset":
+        assert result.pending_mark == expected_pending_mark
 
 
 def assert_error(result, line=None, substring=None):
@@ -119,12 +137,22 @@ def test_unmatched_dd():
     assert_error(result, line=2, substring="unmatched 'dd'")
 
 
-def test_unmatched_cc_block_no_destination():
+def test_cc_block_with_no_destination_becomes_a_pending_mark_not_an_error():
+    # A valid cc-block source (properly closed by a second `cc`) with no
+    # a/b destination doesn't error — it becomes a pending copy mark, only
+    # resolved later by an explicit CUT primary command (execute_cut=True;
+    # see the execute_cut/pending_mark tests below). The document and
+    # clipboard are both untouched until that happens.
     result = run(DOC, [(1, "cc"), (2, "cc")])
-    assert_error(result, line=1, substring="has no destination marker")
+    assert_ok(result, DOC, expected_pending_mark={"kind": "copy", "start": 1, "end": 2})
+    assert prefix_commands._clipboard == []
 
 
-def test_orphan_destination_marker():
+def test_orphan_destination_marker_is_an_error():
+    # Unchanged from the original design: a lone a/b with no pending
+    # copy/move source is an error — PASTE (a primary command) is the
+    # only route to the clipboard's destination side, and it doesn't use
+    # a/b at all.
     result = run(DOC, [(3, "a")])
     assert_error(result, line=3, substring="no pending copy or move")
 
@@ -359,3 +387,178 @@ def test_shift_does_not_move_or_drop_a_label_on_the_line():
 def test_shift_malformed_code_is_unknown_command():
     result = run(DOC, [(1, "()")])
     assert_error(result, line=1, substring="unknown line command")
+
+
+def test_repeat_block_default_once():
+    result = run(DOC, [(2, "rr"), (3, "rr")])
+    assert_ok(result, ["one", "two", "three", "two", "three", "four", "five"])
+
+
+def test_repeat_block_count_on_opening_marker():
+    result = run(DOC, [(2, "rr2"), (3, "rr")])
+    assert_ok(result, ["one", "two", "three", "two", "three", "two", "three", "four", "five"])
+
+
+def test_repeat_block_count_on_closing_marker():
+    result = run(DOC, [(2, "rr"), (3, "rr3")])
+    assert_ok(result, [
+        "one", "two", "three", "two", "three", "two", "three", "two", "three", "four", "five",
+    ])
+
+
+def test_repeat_block_unmatched():
+    result = run(DOC, [(2, "rr")])
+    assert_error(result, line=2, substring="unmatched 'rr'")
+
+
+def test_repeat_block_preserves_a_label_on_the_original_block():
+    result = run(DOC, [(2, "rr"), (3, "rr")], labels={"A": 2})
+    assert_ok(result, ["one", "two", "three", "two", "three", "four", "five"], expected_labels={"A": 2})
+
+
+def test_uc_single_line():
+    result = run(["abc", "def"], [(1, "uc")])
+    assert_ok(result, ["ABC", "def"])
+
+
+def test_lc_single_line():
+    result = run(["ABC", "DEF"], [(1, "lc")])
+    assert_ok(result, ["abc", "DEF"])
+
+
+def test_uc_block_range():
+    result = run(["abc", "def", "ghi"], [(1, "uc"), (3, "uc")])
+    assert_ok(result, ["ABC", "DEF", "GHI"])
+
+
+def test_uc_too_many_markers_is_ambiguous():
+    result = run(DOC, [(1, "uc"), (2, "uc"), (3, "uc")])
+    assert_error(result, line=1, substring="can mark at most one line or a two-line range")
+
+
+def test_uc_code_is_case_insensitive():
+    result = run(["abc"], [(1, "UC")])
+    assert_ok(result, ["ABC"])
+
+
+def test_uc_and_lc_are_independent_in_the_same_batch():
+    result = run(["abc", "DEF"], [(1, "uc"), (2, "lc")])
+    assert_ok(result, ["ABC", "def"])
+
+
+def test_uc_does_not_affect_a_label_on_the_line():
+    result = run(["abc", "def"], [(1, "uc")], labels={"A": 1})
+    assert_ok(result, ["ABC", "def"], expected_labels={"A": 1})
+
+
+def test_c_alone_becomes_a_pending_copy_mark():
+    result = run(DOC, [(2, "c")])
+    assert_ok(result, DOC, expected_pending_mark={"kind": "copy", "start": 2, "end": 2})
+    assert prefix_commands._clipboard == []
+
+
+def test_m_alone_becomes_a_pending_move_mark_without_removing_the_line_yet():
+    result = run(DOC, [(2, "m")])
+    assert_ok(result, DOC, expected_pending_mark={"kind": "move", "start": 2, "end": 2})
+    assert prefix_commands._clipboard == []
+
+
+def test_mm_block_alone_becomes_a_pending_move_mark():
+    result = run(DOC, [(2, "mm"), (4, "mm")])
+    assert_ok(result, DOC, expected_pending_mark={"kind": "move", "start": 2, "end": 4})
+
+
+def test_setting_a_new_mark_while_one_is_already_pending_is_an_error():
+    result = run(DOC, [(2, "c")], pending_mark={"kind": "copy", "start": 5, "end": 5})
+    assert_error(result, line=2, substring="already pending")
+
+
+def test_paired_c_plus_a_in_file_copy_coexists_with_an_unpaired_m_mark_in_one_batch():
+    # Line 1's `c` pairs with line 3's `a` — an immediate, ordinary in-file
+    # copy, completely unrelated to the clipboard. Line 5's `m` has no
+    # pairing of its own, so it becomes a pending mark instead — both in
+    # the same batch, independently. Since the copy inserts a new line,
+    # line 5's mark is correctly remapped to its new position (6).
+    result = run(DOC, [(1, "c"), (3, "a"), (5, "m")])
+    assert_ok(result, ["one", "two", "three", "one", "four", "five"],
+              expected_pending_mark={"kind": "move", "start": 6, "end": 6})
+    assert prefix_commands._clipboard == []
+
+
+def test_execute_cut_with_copy_mark_copies_non_destructively():
+    result = run(DOC, [], pending_mark={"kind": "copy", "start": 2, "end": 2}, execute_cut=True)
+    assert_ok(result, DOC, expected_pending_mark=None)
+    assert prefix_commands._clipboard == ["two"]
+
+
+def test_execute_cut_with_move_mark_removes_and_stores():
+    result = run(DOC, [], pending_mark={"kind": "move", "start": 2, "end": 2}, execute_cut=True)
+    assert_ok(result, ["one", "three", "four", "five"], expected_pending_mark=None)
+    assert prefix_commands._clipboard == ["two"]
+
+
+def test_execute_cut_with_a_block_mark():
+    result = run(DOC, [], pending_mark={"kind": "move", "start": 2, "end": 4}, execute_cut=True)
+    assert_ok(result, ["one", "five"], expected_pending_mark=None)
+    assert prefix_commands._clipboard == ["two", "three", "four"]
+
+
+def test_execute_cut_with_no_pending_mark_is_an_error():
+    result = run(DOC, [], execute_cut=True)
+    assert_error(result, substring="nothing marked for cut")
+
+
+def test_execute_paste_after():
+    prefix_commands._clipboard = ["X"]
+    result = run(DOC, [], execute_paste={"line": 1, "before": False})
+    assert_ok(result, ["one", "X", "two", "three", "four", "five"])
+
+
+def test_execute_paste_before():
+    prefix_commands._clipboard = ["X"]
+    result = run(DOC, [], execute_paste={"line": 1, "before": True})
+    assert_ok(result, ["X", "one", "two", "three", "four", "five"])
+
+
+def test_execute_paste_with_empty_clipboard_is_an_error():
+    result = run(DOC, [], execute_paste={"line": 1, "before": False})
+    assert_error(result, line=1, substring="clipboard is empty")
+
+
+def test_execute_paste_does_not_consume_the_clipboard():
+    prefix_commands._clipboard = ["X"]
+    run(DOC, [], execute_paste={"line": 1, "before": False})
+    assert prefix_commands._clipboard == ["X"]
+    result = run(DOC, [], execute_paste={"line": 5, "before": False})
+    assert_ok(result, ["one", "two", "three", "four", "five", "X"])
+
+
+def test_execute_cut_then_execute_paste_across_different_documents():
+    # The whole point of the redesign: mark+CUT in one file, PASTE in a
+    # completely different one.
+    mark_result = run(["fileA-1", "fileA-2"], [(1, "m")])
+    cut_result = run(mark_result.plan.lines, [], pending_mark=mark_result.pending_mark, execute_cut=True)
+    assert cut_result.pending_mark is None
+    assert prefix_commands._clipboard == ["fileA-1"]
+
+    paste_result = run(["fileB-1", "fileB-2"], [], execute_paste={"line": 2, "before": False})
+    assert_ok(paste_result, ["fileB-1", "fileB-2", "fileA-1"])
+
+
+def test_pending_mark_is_remapped_through_a_later_unrelated_batch():
+    mark_result = run(DOC, [(5, "c")])
+    result = run(DOC, [(2, "d")], pending_mark=mark_result.pending_mark)
+    assert_ok(result, ["one", "three", "four", "five"], expected_pending_mark={"kind": "copy", "start": 4, "end": 4})
+
+
+def test_pending_mark_dropped_when_its_line_is_deleted():
+    mark_result = run(DOC, [(2, "c")])
+    result = run(DOC, [(2, "d")], pending_mark=mark_result.pending_mark)
+    assert_ok(result, ["one", "three", "four", "five"], expected_pending_mark=None)
+
+
+def test_a_rejected_batch_does_not_commit_a_cut_to_the_clipboard():
+    prefix_commands._clipboard = ["preexisting"]
+    result = run(DOC, [(99, "d")], pending_mark={"kind": "move", "start": 2, "end": 2}, execute_cut=True)
+    assert result.errors
+    assert prefix_commands._clipboard == ["preexisting"]

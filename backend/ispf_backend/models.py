@@ -42,3 +42,12 @@ class ProcessResult:
     # this batch's x/xx ops (same drop-on-delete/follow-on-move remap as
     # labels). None when the batch was rejected, for the same reason.
     excluded_lines: list[int] | None = None
+    # Updated pending copy/move mark — {"kind": "copy"|"move", "start":
+    # int, "end": int} or None — left behind by an unpaired c/cc/m/mm
+    # (paired ones, i.e. c/m WITH an a/b destination in the same batch,
+    # still do an immediate in-file copy/move exactly as always and never
+    # touch this). Remapped the same way as labels/excluded_lines (follows
+    # a moved line, dropped if its line is deleted). Cleared to None once
+    # a CUT primary command (execute_cut=True) resolves it. Same
+    # None-on-rejection rule as labels/excluded_lines.
+    pending_mark: dict | None = None

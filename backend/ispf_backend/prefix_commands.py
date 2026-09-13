@@ -10,16 +10,37 @@ ISPF's behavior of refusing to act on a line-command set it can't resolve.
 Supported commands (case-insensitive):
   d[n]   delete n lines starting here (default n=1)
   r[n]   repeat this line n times (default n=1)
+  rr..rr repeat the block between two `rr` lines once; a count on EITHER
+         marker (`rr3`) repeats it that many times instead — if both
+         markers carry an explicit count, the closing one wins
   i[n]   insert n blank lines after this line (default n=1)
-  c[n]   mark n lines starting here as a copy source
-  m[n]   mark n lines starting here as a move source
+  c[n]   mark n lines starting here as a copy source. If paired with an
+         a/b destination elsewhere in the same batch, copies within the
+         document as always (unchanged, immediate, in-file). If left
+         WITHOUT a destination by the end of the batch, it instead
+         becomes a PENDING MARK — persistent caller-owned state (see the
+         `pending_mark` parameter/return value on `process()`), not an
+         error and not an immediate clipboard write — that a later CUT
+         *primary* command (not a prefix command; this module never
+         triggers it on its own) resolves into a clipboard COPY, exactly
+         as if `c` meant "copy" and CUT meant "now actually do it".
+  m[n]   mark n lines starting here as a move source. Same in-file
+         behavior as `c[n]` when paired with a/b; left unpaired, it
+         becomes the same kind of pending mark, but CUT resolves it into
+         a clipboard MOVE (removes the lines) instead of a copy.
   dd..dd delete the block between two `dd` lines (inclusive)
-  cc..cc mark the block between two `cc` lines as a copy source
-  mm..mm mark the block between two `mm` lines as a move source
-  a      destination marker: "after this line" (pairs with a pending
-         c/cc/m/mm source)
-  b      destination marker: "before this line" (pairs with a pending
-         c/cc/m/mm source)
+  cc..cc mark the block between two `cc` lines as a copy source — the
+         block must still be closed by a second `cc` (unmatched is an
+         error, same as `dd`/`mm`/`xx`); see `c[n]` above for what
+         happens once it's a valid source with no a/b destination
+  mm..mm mark the block between two `mm` lines as a move source (see
+         `m[n]` above for the unpaired-mark behavior)
+  a      destination marker: "after this line" — pairs with a pending
+         c/cc/m/mm source for an immediate in-file copy/move, exactly as
+         always. A lone `a` with no pending source is still an error
+         (unchanged) — PASTE (a *primary* command, not this one) is the
+         only way to insert the clipboard, and it doesn't use a/b at all.
+  b      destination marker: "before this line" — same as `a` above.
   )      SHIFT the line's text right by the default shift width (2 columns)
   ))     SHIFT right by 2x the default width per extra repeated `)`
          (`)))` = 3x, etc.) — or use `>`, `>>`, `>>>`, ... instead, an
@@ -54,6 +75,42 @@ Supported commands (case-insensitive):
          resolve those two to the first/last line on demand rather than
          storing them here.
   .      clear whatever label is on this line (no-op if none)
+  uc     UPPERCASE this line's text
+  lc     lowercase this line's text
+  uc..uc / lc..lc  UPPERCASE/lowercase the block between two markers,
+         inclusive — like the block delete/copy/move/exclude codes
+         above, one `uc` alone would be an error there, but here it
+         doesn't need doubling to a 4-letter form: appearing on exactly
+         ONE line converts just that line, appearing on exactly TWO
+         lines converts the range between them (matching real ISPF),
+         and appearing on more than two is rejected as ambiguous.
+Neither CUT nor PASTE is a prefix command at all — both are *primary*
+commands (`extension/media/primaryCommand.ts`), forwarded to this module
+as `execute_cut`/`execute_paste` flags on `process()` rather than typed
+in the gutter:
+
+  execute_cut=True    Resolves whatever `pending_mark` was passed in (see
+                       c/cc/m/mm above): a "copy" mark COPIES those lines
+                       into the shared clipboard (document unchanged); a
+                       "move" mark CUTS them (removes them, same as a
+                       move always has). Clears `pending_mark` to None
+                       either way. An error ("nothing marked for cut") if
+                       there's no pending mark to resolve.
+  execute_paste={"line": int, "before": bool}
+                       Inserts the clipboard's current lines after/before
+                       `line` (like `i[n]`, but with the clipboard's
+                       actual content instead of n blank lines). Doesn't
+                       consume/clear the clipboard, so pasting the same
+                       content again later — or in a different open
+                       document's batch — is fine. An empty clipboard
+                       makes this an error rather than a silent no-op.
+
+The clipboard itself (see `_clipboard`) is genuine mutable module state,
+not threaded through `process()`'s parameters/return value the way
+`pending_mark`/labels/excluded_lines are — it's deliberately shared
+across EVERY call to `process()` for the lifetime of the backend
+process, including calls for other open documents, so a PASTE in a
+different file can retrieve what a CUT in this one just stored.
 """
 from __future__ import annotations
 
@@ -70,8 +127,20 @@ _LABEL_RE = re.compile(r"^\.([A-Za-z][A-Za-z0-9]{0,7})$")
 # "unknown line command" error instead of matching here.
 _SHIFT_RE = re.compile(r"^([()<>])(\1*|\d*)$")
 _SHIFT_DEFAULT_WIDTH = 2
+_BLOCK_REPEAT_RE = re.compile(r"^rr(\d*)$")
 _BLOCK_CODES = ("dd", "cc", "mm", "xx")
 _DEST_CODES = ("a", "b")
+_CASE_CODES = ("uc", "lc")
+
+# The one piece of genuine mutable module state in this otherwise-pure
+# module — see the CUT/PASTE entry in the docstring above for why: it
+# must survive across `process()` calls for DIFFERENT documents in the
+# same backend process, which rules out threading it through the
+# request/response protocol the way pending_mark/labels/excluded_lines
+# are (those are explicitly per-document, caller-owned). Tests must
+# reset this between cases (see test_prefix_commands.py's autouse
+# fixture).
+_clipboard: list[str] = []
 
 
 class _ParseError(Exception):
@@ -99,21 +168,54 @@ def _parse_one(cmd: Command) -> tuple[str, int]:
     return category, count
 
 
+def _pair_or_single(occurrences: list[int], code_name: str, errors: list[CommandError]) -> tuple[int, int, set[int]] | None:
+    """UC/LC share this: the code appearing on exactly one line means
+    'just this line', on exactly two means 'the range between them'
+    (matching real ISPF), and on more than two is rejected as ambiguous
+    rather than guessed at. Returns (start, end, defining) or None (either
+    nothing to do, or an error was appended)."""
+    if not occurrences:
+        return None
+    if len(occurrences) == 1:
+        line = occurrences[0]
+        return line, line, {line}
+    if len(occurrences) == 2:
+        start, end = sorted(occurrences)
+        return start, end, {start, end}
+    errors.append(CommandError(
+        occurrences[0],
+        f"'{code_name}' can mark at most one line or a two-line range; found {len(occurrences)} in this batch",
+    ))
+    return None
+
+
 def process(
     lines: list[str],
     commands: list[Command],
     labels: dict[str, int] | None = None,
     excluded_lines: list[int] | None = None,
+    pending_mark: dict | None = None,
+    execute_cut: bool = False,
+    execute_paste: dict | None = None,
 ) -> ProcessResult:
+    global _clipboard
     labels = dict(labels or {})
     excluded_lines = set(excluded_lines or ())
+    result_pending_mark = dict(pending_mark) if pending_mark else None
+    # Snapshot once, up front: an `execute_paste` here always sees the
+    # clipboard as it stood before an `execute_cut` in this SAME call (see
+    # the CUT/PASTE docstring entry for why that's simpler and more
+    # predictable than trying to make them chain in one call — in
+    # practice the caller never actually requests both at once anyway).
+    clipboard_snapshot = list(_clipboard)
     commands = [c for c in commands if c.code.strip()]
-    if not commands:
+    if not commands and not execute_cut and execute_paste is None:
         return ProcessResult(
             errors=[],
             plan=LinePlan(lines=list(lines), consumed_lines=[]),
             labels=labels,
             excluded_lines=sorted(excluded_lines),
+            pending_mark=result_pending_mark,
         )
 
     n = len(lines)
@@ -133,8 +235,11 @@ def process(
 
     parsed: list[tuple[int, str, int]] = []  # (line, category, count)
     label_ops: list[tuple[int, str | None]] = []  # (line, new name, or None to clear)
+    case_lines: dict[str, list[int]] = {"uc": [], "lc": []}
+    pending_rr_count = 1
     for cmd in sorted(commands, key=lambda c: c.line):
         code = cmd.code.strip()
+        code_lower = code.lower()
         if code == ".":
             label_ops.append((cmd.line, None))
             continue
@@ -166,12 +271,33 @@ def process(
                 amount = (1 + len(rest)) * _SHIFT_DEFAULT_WIDTH
             parsed.append((cmd.line, "shift", direction * amount))
             continue
+        if code_lower in _CASE_CODES:
+            case_lines[code_lower].append(cmd.line)
+            continue
+        rr_match = _BLOCK_REPEAT_RE.match(code_lower)
+        if rr_match:
+            digits = rr_match.group(1)
+            count = int(digits) if digits else 1
+            if count < 1:
+                errors.append(CommandError(cmd.line, f"repeat count must be at least 1 in '{cmd.code}'"))
+                continue
+            parsed.append((cmd.line, "rr", count))
+            continue
         try:
             category, count = _parse_one(cmd)
         except _ParseError as e:
             errors.append(CommandError(e.line, e.message))
             continue
         parsed.append((cmd.line, category, count))
+    if errors:
+        return ProcessResult(errors=errors, plan=None)
+
+    operations: list[tuple] = []
+    for code_name, direction in (("uc", "upper"), ("lc", "lower")):
+        resolved = _pair_or_single(case_lines[code_name], code_name, errors)
+        if resolved:
+            start, end, defining = resolved
+            operations.append(("case", start, end, direction, defining))
     if errors:
         return ProcessResult(errors=errors, plan=None)
 
@@ -186,13 +312,14 @@ def process(
     if errors:
         return ProcessResult(errors=errors, plan=None)
 
-    # operations: tuples of
+    # operations (appended to the `operations` list built above from
+    # UC/LC) also include:
     #   ("delete", start, end, defining_lines)
     #   ("repeat", line, count, defining_lines)
+    #   ("repeat_block", start, end, count, defining_lines)
     #   ("insert", line, count, defining_lines)
     #   ("copy"/"move", start, end, dest, before, defining_lines)
-    operations: list[tuple] = []
-    pending_block: dict[str, int | None] = {"dd": None, "cc": None, "mm": None, "xx": None}
+    pending_block: dict[str, int | None] = {"dd": None, "cc": None, "mm": None, "xx": None, "rr": None}
     # Copy/move sources and their a/b destination markers don't have to
     # appear in a fixed relative order (moving a line UP means the
     # destination marker's line number is smaller than the source's), so
@@ -201,9 +328,11 @@ def process(
     src_dest_events: list[tuple[str, dict]] = []
 
     for line, category, count in parsed:
-        if category in _BLOCK_CODES:
+        if category in _BLOCK_CODES or category == "rr":
             if pending_block[category] is None:
                 pending_block[category] = line
+                if category == "rr":
+                    pending_rr_count = count
                 continue
             start, end = pending_block[category], line
             pending_block[category] = None
@@ -211,6 +340,13 @@ def process(
                 operations.append(("delete", start, end, {start, end}))
             elif category == "xx":
                 operations.append(("exclude", start, end, {start, end}))
+            elif category == "rr":
+                # Whichever marker gave an explicit (>1) count wins; the
+                # closing one is checked first since it's more likely to
+                # be the one someone actually meant if both happen to
+                # specify one (a rare, unrecommended thing to do anyway).
+                final_count = count if count > 1 else (pending_rr_count if pending_rr_count > 1 else 1)
+                operations.append(("repeat_block", start, end, final_count, {start, end}))
             else:
                 kind = "copy" if category == "cc" else "move"
                 src_dest_events.append(("source", {"kind": kind, "start": start, "end": end,
@@ -267,12 +403,49 @@ def process(
     if pending is not None and not errors:
         event_type, info = pending
         if event_type == "source":
-            errors.append(CommandError(
-                info["anchor"],
-                f"{info['kind']} starting at line {info['anchor']} has no destination marker (a/b)",
-            ))
+            # A single leftover, unpaired c/cc/m/mm source: this is where
+            # it becomes a pending mark (see the c/cc/m/mm docstring
+            # entries above) rather than an error — but not if the caller
+            # already had one pending (from an earlier batch) that hasn't
+            # been resolved with CUT yet; stacking a second one silently
+            # would just lose track of the first.
+            if result_pending_mark is not None:
+                errors.append(CommandError(
+                    info["anchor"],
+                    f"a {result_pending_mark['kind']} mark from line(s) "
+                    f"{result_pending_mark['start']}-{result_pending_mark['end']} is already pending "
+                    "— use CUT first",
+                ))
+            else:
+                result_pending_mark = {"kind": info["kind"], "start": info["start"], "end": info["end"]}
         else:
-            errors.append(CommandError(info["line"], f"destination marker on line {info['line']} has no pending copy or move command"))
+            # A lone a/b with no pending source: still an error, same as
+            # always — PASTE (a primary command) is the only route to the
+            # clipboard's destination side, and it doesn't use a/b.
+            errors.append(CommandError(
+                info["line"],
+                f"destination marker on line {info['line']} has no pending copy or move command",
+            ))
+    if errors:
+        return ProcessResult(errors=errors, plan=None)
+
+    if execute_cut:
+        if result_pending_mark is None:
+            errors.append(CommandError(0, "nothing marked for cut — use c/cc or m/mm first"))
+        else:
+            clip_kind = "clip_copy" if result_pending_mark["kind"] == "copy" else "cut"
+            operations.append((clip_kind, result_pending_mark["start"], result_pending_mark["end"],
+                                {result_pending_mark["start"], result_pending_mark["end"]}))
+            result_pending_mark = None
+    if errors:
+        return ProcessResult(errors=errors, plan=None)
+
+    if execute_paste is not None:
+        if not clipboard_snapshot:
+            errors.append(CommandError(execute_paste["line"], "clipboard is empty, nothing to paste"))
+        else:
+            operations.append(("paste", execute_paste["line"], len(clipboard_snapshot),
+                                execute_paste["before"], {execute_paste["line"]}))
     if errors:
         return ProcessResult(errors=errors, plan=None)
 
@@ -287,7 +460,9 @@ def process(
         kind = op[0]
         if kind == "shift":
             continue
-        if kind in ("delete", "repeat", "insert", "exclude"):
+        if kind in ("case", "repeat_block", "paste"):
+            _, start, end, _extra, defining = op
+        elif kind in ("delete", "repeat", "insert", "exclude", "cut", "clip_copy"):
             _, start, end, defining = op
         else:
             _, start, end, dest, _before, defining = op
@@ -325,6 +500,11 @@ def process(
     # (copies/repeats/inserted blanks are new lines that never held a
     # label, and only take on one of their own via a fresh `.name` op).
     line_new_key: dict[int, tuple[int, int]] = {i + 1: (i + 1, 0) for i in range(n)}
+    # Set if this batch has a `cut` — committed to the real `_clipboard`
+    # global only once we know the whole batch succeeds (see the return at
+    # the bottom); `lines` (the ORIGINAL, unmutated input) is still exactly
+    # what was on-screen when `cut` was typed, so it's safe to read here.
+    pending_clipboard_update: list[str] | None = None
 
     for op in operations:
         kind = op[0]
@@ -335,12 +515,43 @@ def process(
             _, line, count, _defining = op
             for k in range(1, count + 1):
                 entries[(line, k)] = lines[line - 1]
+        elif kind == "repeat_block":
+            _, start, end, count, _defining = op
+            block = [lines[i - 1] for i in range(start, end + 1)]
+            minor = 1
+            for _rep in range(count):
+                for text in block:
+                    entries[(end, minor)] = text
+                    minor += 1
         elif kind == "insert":
             _, line, count, _defining = op
             for k in range(1, count + 1):
                 entries[(line, k)] = ""
+        elif kind == "paste":
+            _, line, _count, before, _defining = op
+            if before:
+                base = -len(clipboard_snapshot)
+                for idx, text in enumerate(clipboard_snapshot):
+                    entries[(line, base + idx)] = text
+            else:
+                for idx, text in enumerate(clipboard_snapshot, start=1):
+                    entries[(line, idx)] = text
         elif kind == "exclude":
             continue  # doesn't touch the document at all; folded in below
+        elif kind == "cut":
+            _, start, end, _defining = op
+            pending_clipboard_update = [lines[i - 1] for i in range(start, end + 1)]
+            delete_set.update(range(start, end + 1))
+        elif kind == "clip_copy":
+            _, start, end, _defining = op
+            # Non-destructive: unlike `cut`, no delete_set update — the
+            # source lines are left exactly as they are.
+            pending_clipboard_update = [lines[i - 1] for i in range(start, end + 1)]
+        elif kind == "case":
+            _, start, end, direction, _defining = op
+            for ln in range(start, end + 1):
+                text = lines[ln - 1]
+                entries[(ln, 0)] = text.upper() if direction == "upper" else text.lower()
         elif kind == "shift":
             _, line, delta, _defining = op
             text = lines[line - 1]
@@ -417,9 +628,31 @@ def process(
         for original_line in range(start, end + 1):
             new_excluded.add(key_to_new_line[line_new_key[original_line]])
 
+    if pending_clipboard_update is not None:
+        # Only commit the shared clipboard once the whole batch is known to
+        # succeed — every earlier error-return above happens before this
+        # point, so an invalid batch containing a `cut` never touches it.
+        _clipboard = pending_clipboard_update
+
+    # Same drop-on-delete/follow-on-move remap as labels/excluded_lines,
+    # for the pending copy/move mark (if any — None if there never was one,
+    # or if `execute_cut` just resolved and cleared it above).
+    if result_pending_mark is not None:
+        key_start = line_new_key.get(result_pending_mark["start"])
+        key_end = line_new_key.get(result_pending_mark["end"])
+        if key_start is None or key_end is None:
+            result_pending_mark = None
+        else:
+            result_pending_mark = {
+                "kind": result_pending_mark["kind"],
+                "start": key_to_new_line[key_start],
+                "end": key_to_new_line[key_end],
+            }
+
     return ProcessResult(
         errors=[],
         plan=LinePlan(lines=result_lines, consumed_lines=consumed_lines),
         labels=new_labels,
         excluded_lines=sorted(new_excluded),
+        pending_mark=result_pending_mark,
     )
