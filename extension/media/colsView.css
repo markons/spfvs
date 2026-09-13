@@ -1,0 +1,11 @@
+.ispf-cols-zone {
+  font-family: var(--vscode-editor-font-family, monospace);
+  font-size: var(--vscode-editor-font-size, 13px);
+  white-space: pre;
+  color: #7fd0ff;
+  background: rgba(0, 170, 255, 0.08);
+  border-top: 1px dashed #7fd0ff;
+  border-bottom: 1px dashed #7fd0ff;
+  overflow: hidden;
+  box-sizing: border-box;
+}

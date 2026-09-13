@@ -22,9 +22,11 @@ import { PrefixGutter, PrefixCommand, HexToggle } from "./gutter";
 import { executePrimaryCommand } from "./primaryCommand";
 import { ensureExcludeFoldingProviderRegistered, linesToRanges, setExcludedRanges } from "./excludeFolding";
 import { HexView } from "./hexView";
+import { ColsView } from "./colsView";
 import "./gutter.css";
 import "./commandBar.css";
 import "./hexView.css";
+import "./colsView.css";
 
 const vscodeApi = acquireVsCodeApi();
 
@@ -91,6 +93,7 @@ function detectLanguage(fileName: string): string {
 let editor: monaco.editor.IStandaloneCodeEditor | undefined;
 let gutter: PrefixGutter | undefined;
 let hexView: HexView | undefined;
+let colsView: ColsView | undefined;
 let applyingRemoteChange = false;
 
 /** Focuses and selects the COMMAND ===> input, so whatever's typed next
@@ -146,6 +149,8 @@ function boot(text: string, fileName: string): void {
 
   hexView = new HexView(editor, monaco);
   const hexViewForCallback = hexView;
+  colsView = new ColsView(editor, monaco);
+  const colsViewForCallback = colsView;
   gutter = new PrefixGutter(editor, monaco, editorRow, {
     width: GUTTER_WIDTH,
     onCommit: (commands: PrefixCommand[]) => {
@@ -159,6 +164,9 @@ function boot(text: string, fileName: string): void {
           hexViewForCallback.toggle(line);
         }
       }
+    },
+    onColsToggle: (lines: number[]) => {
+      for (const line of lines) colsViewForCallback.toggle(line);
     },
     // Home in a gutter cell always jumps — unlike the main editor, a
     // gutter cell's own "move caret to start of typed text" behavior has

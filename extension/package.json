@@ -2,7 +2,7 @@
   "name": "spfvs",
   "displayName": "SPFVS",
   "description": "An ISPF-style custom editor with a real editable prefix-command gutter, built on Monaco.",
-  "version": "0.0.18",
+  "version": "0.0.19",
   "publisher": "markons",
   "icon": "resources/icon.png",
   "engines": {

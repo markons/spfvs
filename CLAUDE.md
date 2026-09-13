@@ -15,7 +15,60 @@ status entry for what was and wasn't touched. Folder is
 same day; don't confuse either with the unrelated repo git finds by
 walking up to `C:\Users\maga1`).
 
-## Status as of 2026-09-14 (latest): FIND/CHANGE column-range restriction
+## Status as of 2026-09-14 (latest): README screenshot
+
+Owner sent a screenshot of the editor in use (SPFVS editing a PL/I file,
+gutter + `COMMAND ===>` bar both visible) and asked for it in the
+README. Saved to `docs/screenshot.png` (new `docs/` folder — nothing
+else there yet) and embedded right under the intro paragraph in
+`README.md`, before "Project layout" — first thing a Marketplace/GitHub
+visitor sees, per `C:\temp\vsapp.md`'s own advice (written earlier this
+session) that a listing with an image up top converts far better than
+text-only. No code change. Getting the actual image file into this
+session took two failed clipboard-paste attempts before the owner saved
+it to a file and gave the path directly — worth remembering if a future
+session hits the same "user says they pasted an image but nothing
+arrived" situation: ask for a saved file path rather than retrying paste
+indefinitely.
+
+## Status as of 2026-09-14: COLS line command
+
+Owner asked to "install the cols line command." Implemented as a new
+`extension/media/colsView.ts`'s `ColsView` class, deliberately modeled
+directly on `hexView.ts`'s `HexView` (same view-zone mechanism, same
+"intercepted in gutter.ts's `commit()` before it would otherwise reach
+the backend as an unknown command" pattern, same "any document edit
+clears every shown zone" simplification) rather than inventing a new
+approach — `cols` and `hx` are the same *category* of feature (a pure
+view effect, never touching the document or the backend). The one real
+difference: real ISPF's `COLS` line command takes no operand, so unlike
+`hx[n]` there's no counted form — `COLS_CODE_RE = /^cols$/i` (no digit
+group), and `gutter.ts`'s `GutterOptions` grew a plain `onColsToggle:
+(lines: number[]) => void` instead of `HexToggle`'s `{line, count}`
+shape.
+
+The ruler itself (`rulerText()`) reproduces ISPF's own pattern
+character-by-character: `-` per column, `+` every 5th, the tens digit
+(wrapping 1-9-0) every 10th — e.g. `----+----1----+----2----+----3`.
+Its width (`rulerWidth()`) is the longest line currently in the whole
+document, with an 80-column floor for a short/empty file — this project
+has no BOUNDS/record-length concept to size it against exactly (that's
+part of the already-deliberately-deferred MASK/NUMBER/CAPS/HEX-ON/
+BOUNDS cluster from the 2026-09-13 ISPF-parity status entry), so 80 (a
+traditional mainframe record width) is a reasonable stand-in rather
+than a real limit.
+
+`gutter.ts`'s `commit()` was refactored slightly to share one
+`localLines` array between `hx` and `cols` (both are "consumed locally,
+never round-trips through consumedLines") rather than duplicating the
+same clear-and-skip logic under two different names.
+
+No backend changes, no new pytest cases (pure webview view-zone
+feature, exactly the `hx` precedent). `npm run typecheck` and `npm run
+compile` both pass. Packaged and installed as **v0.0.19**. **Not yet
+tested by the owner.**
+
+## Status as of 2026-09-14: FIND/CHANGE column-range restriction
 
 Added ISPF's `FIND string c1 c2` / `CHANGE old new c1 c2` form
 (`extension/media/primaryCommand.ts`, webview-only, no backend change):
@@ -642,11 +695,12 @@ commit/push again on your own initiative, only when asked.
     Also owns the LABEL display/lookup cache (`lineToLabel`/`labelToLine`,
     `setLabels()`, `resolveLabel()`) — it holds no authoritative label
     state itself, just mirrors whatever the extension host last pushed.
-    `commit()` intercepts `hx`/`hx[n]` codes (via `HEX_CODE_RE`) BEFORE
-    they'd otherwise be sent to the backend as a batch — see
-    `hexView.ts`'s class doc comment for why HX never touches the
-    backend at all, unlike every other prefix command including the
-    other view-only ones (`x`/`xx`).
+    `commit()` intercepts `hx`/`hx[n]` codes (via `HEX_CODE_RE`) and bare
+    `cols` (via `COLS_CODE_RE`) BEFORE they'd otherwise be sent to the
+    backend as a batch — see `hexView.ts`/`colsView.ts`'s class doc
+    comments for why neither ever touches the backend at all, unlike
+    every other prefix command including the other view-only ones
+    (`x`/`xx`).
   - `media/hexView.ts` — the `HX` line command's real implementation:
     Monaco's view-zone API (`changeViewZones`/`addZone`/`removeZone`),
     the same "reserve space in the render, not the model" category of
@@ -654,6 +708,11 @@ commit/push again on your own initiative, only when asked.
     doesn't need a `FoldingRangeProvider` — just a DOM node per shown
     line. Deliberately NOT remapped through restructuring the way LABEL/
     EXCLUDE are (any `onDidChangeModelContent` just clears every zone).
+  - `media/colsView.ts` — the `COLS` line command's real implementation
+    (added 2026-09-14), modeled directly on `hexView.ts`'s `HexView` —
+    same view-zone mechanism, same "any edit clears every zone"
+    simplification — but with no counted form, since real ISPF's own
+    COLS takes no operand (see Status above).
   - `media/primaryCommand.ts` — `COMMAND ===>` bar command parsing/
     execution. `find`/`f`/`rfind`/`rf`, `change`/`c`, `sort`, `top`/`t`,
     `bottom`/`bot`, `locate`/`loc`/`l`, `exclude`/`x`, `reset`/`res`
@@ -961,6 +1020,15 @@ real file in the installed extension:
   showing should make them all disappear; try it on a line with
   non-ASCII characters to see what the "masked to one byte" hex actually
   looks like (documented as not real UTF-8, just a peek).
+- COLS line command (new 2026-09-14, entirely unexercised): `cols` on a
+  line shows a column ruler underneath it (`----+----1----+----2...`);
+  typing `cols` again on that same line hides it; the ruler's width
+  should span at least the longest line in the file (verify against a
+  file with a long line); typing directly into Monaco (or committing any
+  prefix-command batch) while a ruler is showing should make it
+  disappear, same as `hx`; there's no counted form — `cols3` should be
+  sent to the backend as an unknown command and error, not treated as
+  "show cols on 3 lines."
 - FIND/CHANGE column-range restriction (new 2026-09-14, entirely
   unexercised): `f 'xxx' 8 10` only finds `xxx` where it lies entirely
   within columns 8-10, ignoring occurrences elsewhere on the line;

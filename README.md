@@ -8,6 +8,8 @@ instead of VS Code's plain line-number column.
 Opens on demand for any file via **Reopen With -> SPFVS** — it does
 not replace VS Code's default editor.
 
+![SPFVS editing a PL/I file: the prefix-command gutter to the left of the code, and the COMMAND ===> bar above it](docs/screenshot.png)
+
 ## Project layout
 
 - `extension/` — the VS Code extension (TypeScript). Owns the custom
@@ -154,6 +156,7 @@ package itself was actually updated first.
 | `lc` | lowercase this line's text |
 | `uc`...`uc` / `lc`...`lc` | UPPERCASE/lowercase the range between two markers, inclusive |
 | `hx[n]` | show n lines' hex representation as two rows underneath each (default 1); typing `hx` again on an already-shown line hides it |
+| `cols` | show/hide an ISPF-style column ruler underneath this line (no count form — toggle only) |
 
 **A lone (unpaired) `c[n]`/`cc`...`cc`/`m[n]`/`mm`...`mm` is not an
 error** — it becomes a *pending mark*, persistent editor-session state
@@ -239,6 +242,19 @@ since toggling several at once when some already had hex shown and
 others didn't would give a confusing mixed result. Any document edit
 hides every currently-shown hex zone rather than trying to keep them
 pinned to lines that may have moved.
+
+`cols` is the same category of pure view effect as `hx` — a column
+ruler (`----+----1----+----2----+----3...`, ISPF's own pattern: a `-`
+per column, `+` every 5th, the tens digit every 10th) shown underneath
+the line, driven by `extension/media/colsView.ts` via the exact same
+view-zone mechanism as `hx`, intercepted locally the same way before it
+would otherwise reach the backend as an unknown command. Unlike `hx`,
+`cols` has no counted form — real ISPF's own COLS line command takes no
+operand either — so it's toggle-only. The ruler spans the longest line
+currently in the document (with an 80-column floor for a short/empty
+file), since this project has no BOUNDS/record-length concept of its
+own to size it against (see "Known limitations"). Any document edit
+hides every currently-shown ruler, same as `hx`.
 
 ## Primary commands
 

@@ -23,6 +23,11 @@ interface GutterOptions {
   // for the counted form (`hx3`); the caller treats that as "show" for
   // each of the n lines, and a bare `hx` (count 1) as "toggle".
   onHexToggle: (toggles: HexToggle[]) => void;
+  // `cols` never reaches the backend either (see commit()'s interception
+  // and colsView.ts's class doc comment) — unlike `hx` it has no counted
+  // form (real ISPF's COLS line command takes no operand), so this is
+  // just the list of lines to toggle the ruler under.
+  onColsToggle: (lines: number[]) => void;
   // HOME in a gutter cell jumps to the COMMAND ===> bar (see main.ts's
   // jumpToCommandBar) — ISPF/3270's "Home goes to the first input field"
   // convention. Unconditional (no "already at start of this cell" guard
@@ -35,6 +40,7 @@ interface GutterOptions {
 // Intercepted in commit() below, before a batch would otherwise be sent
 // to the backend as a set of (mostly unknown-command) prefix commands.
 const HEX_CODE_RE = /^hx(\d*)$/i;
+const COLS_CODE_RE = /^cols$/i;
 
 /**
  * A viewport-synced, editable prefix-command column drawn as a plain DOM
@@ -231,23 +237,30 @@ export class PrefixGutter {
   private commit(): void {
     const commands: PrefixCommand[] = [];
     const hexToggles: HexToggle[] = [];
-    const hexLines: number[] = [];
+    const colsLines: number[] = [];
+    const localLines: number[] = [];
     for (const [line, code] of this.pendingValues) {
       const trimmed = code.trim();
       if (!trimmed) continue;
       const hexMatch = HEX_CODE_RE.exec(trimmed);
       if (hexMatch) {
         hexToggles.push({ line, count: hexMatch[1] ? parseInt(hexMatch[1], 10) : 1 });
-        hexLines.push(line);
+        localLines.push(line);
+        continue;
+      }
+      if (COLS_CODE_RE.test(trimmed)) {
+        colsLines.push(line);
+        localLines.push(line);
         continue;
       }
       commands.push({ line, code: trimmed });
     }
-    // hx is consumed locally right away (see HexView) — it never goes
-    // through the backend, so there's no "consumedLines" round trip to
-    // wait for before clearing its cell.
-    if (hexLines.length > 0) this.clearLines(hexLines);
+    // hx/cols are consumed locally right away (see HexView/ColsView) —
+    // neither goes through the backend, so there's no "consumedLines"
+    // round trip to wait for before clearing their cells.
+    if (localLines.length > 0) this.clearLines(localLines);
     if (hexToggles.length > 0) this.options.onHexToggle(hexToggles);
+    if (colsLines.length > 0) this.options.onColsToggle(colsLines);
     if (commands.length === 0) return;
     this.options.onCommit(commands);
   }
