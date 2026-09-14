@@ -52,7 +52,7 @@ commandInput.className = "ispf-command-input";
 commandInput.autocomplete = "off";
 commandInput.spellcheck = false;
 commandInput.disabled = true;
-commandInput.placeholder = "find/f [c1 c2] [first|last|prev|all], rfind/rf, change/c [c1 c2] [scope], sort [c1 c2] [a|d], cut, paste [a|b], top, bottom, locate/loc/l .label|line, exclude/x, reset/res [lab], undo, save, cancel/can, end/pf3";
+commandInput.placeholder = "find/f [word] [c1 c2] [first|last|prev|all], rfind/rf, change/c [word] [c1 c2] [scope], sort [c1 c2] [a|d], cut, paste [a|b], top, bottom, locate/loc/l .label|line, exclude/x, reset/res [lab], undo, save, cancel/can, end/pf3, help/h";
 const commandMessage = document.createElement("span");
 commandMessage.className = "ispf-command-message";
 commandBar.appendChild(commandLabel);
@@ -198,7 +198,14 @@ commandInput.addEventListener("keydown", (e) => {
   const notifyExcludedLinesChanged = (lines: number[]) => {
     vscodeApi.postMessage({ type: "excludedLinesChanged", lines });
   };
-  void executePrimaryCommand(currentEditor, rawCommand, resolveLabel, notifyExcludedLinesChanged).then((outcome) => {
+  // RESET/RES clears any shown HX/COLS rulers too (see primaryCommand.ts's
+  // ViewZoneClearer doc comment) — neither has a document edit of its own
+  // to otherwise trigger this cleanup.
+  const clearViewZones = () => {
+    hexView?.hideAll();
+    colsView?.hideAll();
+  };
+  void executePrimaryCommand(currentEditor, rawCommand, resolveLabel, notifyExcludedLinesChanged, clearViewZones).then((outcome) => {
     if (outcome.kind === "forward") {
       // Spread everything but `kind` — PASTE's outcome carries extra
       // `line`/`before` fields the extension host needs; every other

@@ -15,7 +15,241 @@ status entry for what was and wasn't touched. Folder is
 same day; don't confuse either with the unrelated repo git finds by
 walking up to `C:\Users\maga1`).
 
-## Status as of 2026-09-14 (latest): README screenshot
+## Status as of 2026-09-14 (latest): HELP primary command
+
+Owner asked for a "help primary command which shows all actual
+implemented primary and line command syntax." New `HELP`/`H` primary
+command opens a plain, static text summary as a new, ordinary VS Code
+tab beside the current one (`vscode.workspace.openTextDocument({content,
+language:"plaintext"})` + `showTextDocument(..., {viewColumn:
+vscode.ViewColumn.Beside})`) — NOT another SPFVS custom editor instance,
+just a normal scrollable/searchable text buffer, since a full multi-line
+reference doesn't fit in the single-line `COMMAND ===>` status message
+the way every other command's feedback does.
+
+The reference text itself is a new module-level string constant,
+`HELP_TEXT` in a new file `extension/src/helpText.ts` — deliberately
+placed in `src/` (the extension-host bundle), NOT `media/` (the webview
+bundle), because opening a new editor tab is an extension-host-only API
+(`vscode.workspace.openTextDocument`/`showTextDocument` don't exist in
+the webview's sandboxed context) — `ispfEditorProvider.ts` imports it
+directly. `HELP` itself is forwarded from the webview exactly like
+`cut`/`resetLabels`/etc. (`primaryCommand.ts`'s `CommandOutcome` gained
+`"help"` in its forward-action union; `ispfEditorProvider.ts`'s
+`handlePrimaryAction` gained a `case "help"`) purely for this reason,
+even though — unlike every other forwarded action — it never touches
+the current document or any extension-host state at all.
+
+`HELP_TEXT` is a hand-maintained plain-text mirror of README.md's
+prefix-command and primary-command tables (not generated from them) —
+**keep it in sync manually whenever a command's syntax changes**, the
+same discipline this file's own "Conventions" section already asks for
+between README and CLAUDE.md. A fresh untitled document is opened every
+time `HELP`/`H` runs rather than reusing/tracking a single instance —
+simpler, and safe since the content is static (no live document state
+to go stale).
+
+`npm run typecheck` and `npm run compile` both pass. No backend
+changes, no new pytest cases (pure webview-forward + extension-host tab
+opening). Packaged and installed as **v0.0.23**. **Not yet tested by
+the owner.**
+
+## Status as of 2026-09-14: fixed the v0.0.21 regression, + WORD qualifier + gutter arrow-key nav
+
+**Reverted the previous entry's `getTopForLineNumber(line, true)` change
+— it was based on a wrong root-cause diagnosis and introduced a real
+regression**, caught immediately by the owner retesting: "'res' resets
+now 'cols' line. but now not the 'cols' line-number part is locked, but
+rather the line under." Read Monaco's own source this time instead of
+guessing (`node_modules/monaco-editor/esm/vs/editor/common/viewLayout/
+linesLayout.js`'s `getVerticalOffsetForLineNumber`): the accumulated-
+whitespace-height lookup is computed for `lineNumber - (includeViewZones
+? 1 : 0)`. For a SINGLE zone anchored at `afterLineNumber = N` and the
+very next real line `N+1`: the DEFAULT (`includeViewZones=false`, i.e.
+plain `getTopForLineNumber(line)`, no second argument) already looks up
+whitespace-before `N+1`, which correctly includes the zone (since `N <
+N+1`). Passing `true` instead looks up whitespace-before `N+1-1 = N`,
+which EXCLUDES that exact same zone (since `N < N` is false) — i.e. it
+un-counts the zone specifically for the one line immediately after it,
+while every line further below is unaffected either way (the boundary
+condition only bites at that one line). This is the OPPOSITE of a fix:
+default was already correct, and `true` broke exactly the line the
+owner then reported as newly "locked." **Takeaway for future sessions:
+`includeViewZones` is not a generic "account for zones" toggle — verify
+against Monaco's own source before touching this argument again**, not
+just from the `.d.ts` comment (which says nothing about the off-by-one
+semantics). Fixed by reverting to plain `getTopForLineNumber(line)`.
+
+The owner's original "cols line-number part... locked" report (the one
+that prompted the wrong fix) most likely was ALSO about this exact
+same immediately-following-line case all along — their terminology
+("the cols line") plausibly means "the line associated with/right after
+the ruler," not the ruler's own row (which correctly has no gutter cell
+at all, by design, and was never the issue). Reverting should resolve
+both reports at once, since default was correct for this case the whole
+time; if a genuinely different line is still misbehaving after this
+revert, that would point to an actual NEW bug, not this one — ask for
+an exact line number next time before touching gutter geometry again,
+given how easy this area is to misdiagnose (see also the original
+"Debugging journey" section for three earlier rounds of exactly this
+kind of gutter-geometry trouble).
+
+**Feature request 1: `WORD` qualifier for `FIND`/`CHANGE`**
+(`extension/media/primaryCommand.ts`, webview-only, no backend change).
+Real ISPF's own `FIND string WORD` / `CHANGE old new WORD` form:
+restricts a match to a whole word — flanked by a non-alphanumeric
+character (or line start/end) on both sides. Implemented as a straight
+pass-through to Monaco's own `wordSeparators` argument (its own "match
+whole word" mechanism — already accepted by every `findMatches`/
+`findNextMatch`/`findPreviousMatch` call, previously always passed
+`null`) via a new module constant `WORD_SEPARATORS` (every ASCII
+punctuation/whitespace character, i.e. "not a letter/digit/underscore"
+— matches the owner's own framing: "not-alphanumerical-character-
+trimmed part of a string"). New `extractWordQualifier(args,
+minRemaining)` mirrors `extractColumnRange`'s disambiguation pattern
+exactly (same `minRemaining` guard so `find word` alone reads as a
+literal search for "word", not an empty WORD-qualified search).
+
+Real ISPF's token order is `string [WORD] [c1 c2] [scope]` — WORD sits
+BETWEEN the search text and the column range, closest to the text.
+Extraction correspondingly peels from the right in this order:
+`extractTrailingScope` (rightmost) -> `extractColumnRange` -> the new
+`extractWordQualifier` (leftmost of the three optional trailing groups,
+applied to whatever's left after the other two). Module-level
+`lastFindWord` joins `lastFindNeedle`/`lastFindDirection`/
+`lastFindColumnRange` as state a bare `FIND`/`RFIND` repeat reuses.
+
+**Important divergence from the owner's own example worth flagging
+explicitly**: the owner's sample was `c dcl word all declare` (old,
+WORD, scope, new — new text LAST). The actual working syntax follows
+real ISPF's documented grammar instead — new text right after old text,
+always: `c dcl declare word all`. This was a deliberate choice (follow
+the authentic, well-established ISPF grammar rather than guess at a
+possibly-informal example ordering) — flagged to the owner so it can be
+corrected if the informal ordering was actually intended as a real
+design ask, not just how they happened to phrase the request.
+
+**Feature request 2: gutter cells are walkable with Up/Down**
+(`extension/media/gutter.ts`): a real ISPF prefix-area convention this
+project's plain `<input>`-per-line gutter cells had no equivalent for
+(arrow keys do nothing useful in a lone single-line text box otherwise,
+so intercepting them unconditionally — no "already at an edge" guard
+the way Home-in-the-main-editor has one — is safe). New private
+`focusLine(line, caretPos)`: looks up the pooled input for the target
+line, calls `editor.revealLine()` + a synchronous `layout()` first if
+it's not currently pooled (e.g. right at the visible-range buffer's
+edge) so it gets created, then focuses it and restores the caret to the
+same column offset (clamped to the target cell's shorter/longer value
+length) rather than resetting to column 0 — makes walking several cells
+in a row via arrow keys feel continuous rather than jumpy.
+
+`npm run typecheck` and `npm run compile` both pass. No backend changes
+for either feature request, no new pytest cases (both pure webview:
+command-string parsing and DOM focus management respectively).
+Packaged and installed as **v0.0.22**. **Not yet retested by the
+owner** — this is the third round on the gutter-geometry regression
+specifically, so treat "not yet confirmed fixed" as the default
+assumption until the owner explicitly says otherwise.
+
+## Status as of 2026-09-14: gutter cells misplaced below an HX/COLS zone
+
+**Superseded by the entry above — this diagnosis and fix were WRONG,
+reverted in v0.0.22.** Kept for the record since it documents a real,
+verified-from-source Monaco semantics lesson (`includeViewZones` is not
+a simple "account for zones" toggle), just applied to the wrong root
+cause. Read the entry above before touching `gutter.ts`'s
+`getTopForLineNumber` call again.
+
+Owner tested v0.0.20 and reported: after setting a `cols` ruler, "I
+cannot retype the number area of this new line" — clarified via a
+follow-up question into: they weren't trying to type into the ruler's
+own row (which correctly has no gutter cell — it's not a document
+line), they were trying to use the gutter cell that visually sits near
+it, which behaved wrong.
+
+**Root cause, confirmed by reading Monaco's own source**
+(`node_modules/monaco-editor/esm/vs/editor/browser/widget/codeEditor/
+codeEditorWidget.js`): `getTopForLineNumber(lineNumber, includeViewZones
+= false)` — the `includeViewZones` parameter **defaults to false**.
+`gutter.ts`'s `layout()` was calling it with just `(line)`, so as soon
+as an `hx`/`cols` zone is shown, every gutter cell for a REAL line
+**below** that zone was positioned as if the zone weren't there — too
+high, landing on/near the zone's own visual row instead of the actual
+line it belongs to. Clicking what looked like "the new [ruler] line's
+cell" was actually a misplaced cell for a different real line entirely
+— objectively broken, not a misunderstanding of the "ruler has no cell"
+design (which is correct and unchanged).
+
+Fixed with a one-line change: `getTopForLineNumber(line, true)`. No
+other geometry call in `gutter.ts` needed the same fix (`getScrollTop()`
+is a scalar already in the zone-inclusive coordinate space, so it needed
+no change). This bug has presumably existed since HX shipped
+(2026-09-13) — it just hadn't been reported, likely because nobody had
+tried typing into a gutter cell for a line sitting below a shown hex
+zone before this COLS testing round surfaced it. **Retest HX below-zone
+gutter typing too, not just COLS**, next time either is exercised.
+
+The owner also asked (via a clarifying round) about a second thing they
+tried: typing `cc` as a line command on one line, then running `RES`,
+expecting it to also clear that pending, uncommitted `cc` out of the
+gutter cell — "nothing happens." This is **not a bug**: an unpaired/
+uncommitted line command sitting in a gutter cell is just literal typed
+text in an `<input>` (`pendingValues`, see gutter.ts) waiting for
+`Enter`, not tracked state the way EXCLUDE/labels/hx/cols are — `RESET`
+was never meant to discard arbitrary in-progress gutter input any more
+than it discards unsaved text typed into the main editor. Clearing it
+manually (select and delete the cell's text, or overwrite it) remains
+the way to back out of a not-yet-committed line command.
+
+`npm run typecheck` and `npm run compile` both pass. No backend
+changes, no new pytest cases (pure webview geometry fix). Packaged and
+installed as **v0.0.21**. **Not yet retested by the owner.**
+
+## Status as of 2026-09-14: RESET now clears HX/COLS rulers too
+
+Owner reported: "if a raster is set by cols, it cannot be revoked. the
+raster line remains as not-editable line, even after a 'res' command."
+Retyping `cols` on the **same originating line** already did (and
+still does) toggle it off — that part of `ColsView`/`HexView` was
+correct — but that's easy to miss, since the ruler itself renders as an
+extra visual row with no gutter cell of its own to type into (it's a
+Monaco view zone, not a real document line — see colsView.ts/hexView.ts's
+class doc comments), and nothing about it visually points back at the
+real line above it that owns the toggle. The owner's other reach —
+`RESET`/`RES` — did NOT clear it, which from the outside looks
+indistinguishable from "stuck forever": `RES` already clears
+EXCLUDE'd/x'd lines, so expecting it to also clear a ruler is a
+reasonable, ISPF-consistent "get the screen back to normal" mental
+model, even though real ISPF's own RESET/HEX-OFF/COLS-OFF are
+technically separate toggles.
+
+Fixed the actual complaint by making `RES` (not `RES LAB`, which is
+already scoped to labels only) ALSO clear every shown `hx`/`cols` zone,
+on top of its existing un-hide-EXCLUDEd-lines job. New `HexView`/
+`ColsView` method `hideAll()` (thin public wrapper around each class's
+existing private `clearAll()`, already used internally on every
+document edit). `primaryCommand.ts`'s `executePrimaryCommand` gained a
+5th parameter, `clearViewZones: ViewZoneClearer` (`() => void`), called
+from the plain-`RESET` branch right alongside the existing
+`setExcludedRanges(editor, [])`/`notifyExcludedLinesChanged([])` calls.
+`main.ts` wires it as `() => { hexView?.hideAll(); colsView?.hideAll();
+}` — passed into `executePrimaryCommand` as the new last argument.
+
+The retype-to-toggle mechanism itself was NOT changed (code review found
+no bug in it — `toggle()`/`show()`/`hide()` in both classes look correct
+in isolation); README's `cols` paragraph now explicitly spells out BOTH
+routes (retype on the source line, or `RES`) so this doesn't recur as a
+"how do I get rid of this" report. If retyping `cols` on the source line
+*still* doesn't remove it after this fix, that would point at an actual
+bug in the toggle path itself, not just a missing RES hook — worth
+distinguishing explicitly if the owner reports it again.
+
+No backend changes, no new pytest cases (pure webview view-zone
+lifecycle, same category as HX/COLS themselves). `npm run typecheck`
+and `npm run compile` both pass. Packaged and installed as **v0.0.20**.
+**Not yet retested by the owner.**
+
+## Status as of 2026-09-14: README screenshot
 
 Owner sent a screenshot of the editor in use (SPFVS editing a PL/I file,
 gutter + `COMMAND ===>` bar both visible) and asked for it in the
@@ -676,16 +910,26 @@ commit/push again on your own initiative, only when asked.
     prefix-command round trip to the Python backend, primary actions that
     need the real document or extension-host state
     (`undo`/`undoAll`/`save`/`cancel`/`end`/`resetLabels`/`cut`/`paste`
-    via `handleClipboardAction` — see below), a `pendingMark` closure
-    variable (added 2026-09-14, same per-document/reset-on-non-batch-
-    edit treatment as `labels`/`excludedLines`, but never itself pushed
-    to the webview since there's nothing to display), cache-busting
-    query param on the webview asset URLs
+    via `handleClipboardAction` — see below, and `help`, which opens
+    `helpText.ts`'s static `HELP_TEXT` as a new tab beside the current
+    one — added 2026-09-14, forwarded purely because opening a tab is an
+    extension-host-only API, not because it touches any state), a
+    `pendingMark` closure variable (added 2026-09-14, same per-document/
+    reset-on-non-batch-edit treatment as `labels`/`excludedLines`, but
+    never itself pushed to the webview since there's nothing to
+    display), cache-busting query param on the webview asset URLs
     (`?v=<extension version>`, added after a debugging round where a
     stale bundle was briefly suspected).
   - `src/backendClient.ts` — spawns one persistent `python -m
     ispf_backend` process per extension host, newline-delimited JSON over
     stdin/stdout, request-id keyed.
+  - `src/helpText.ts` — the `HELP`/`H` primary command's static
+    `HELP_TEXT` string (added 2026-09-14), a hand-maintained plain-text
+    mirror of README.md's command tables. Lives in `src/`, not `media/`,
+    since it's only ever read by `ispfEditorProvider.ts` (opening a new
+    tab is extension-host-only) — keep it in sync manually with README
+    whenever a command's syntax changes, same discipline as this file's
+    own "Conventions" section already asks for.
   - `media/main.ts` — webview entry: boots Monaco, wires the gutter and
     command bar, message bridge to the extension host.
   - `media/gutter.ts` — the editable prefix-command gutter. **Read the
@@ -700,7 +944,15 @@ commit/push again on your own initiative, only when asked.
     backend as a batch — see `hexView.ts`/`colsView.ts`'s class doc
     comments for why neither ever touches the backend at all, unlike
     every other prefix command including the other view-only ones
-    (`x`/`xx`).
+    (`x`/`xx`). Cell vertical positioning uses plain
+    `getTopForLineNumber(line)` — NOT `includeViewZones: true`, which
+    looks like the "obviously correct" fix for a cell rendering wrong
+    near a shown hx/cols zone but is actually backwards for the line
+    immediately after one (see the 2026-09-14 status entries — one wrong
+    attempt, one corrected, with the exact Monaco-source derivation).
+    New private `focusLine(line, caretPos)` (added 2026-09-14) backs
+    Up/Down arrow navigation between cells, ISPF's own prefix-area
+    walking convention.
   - `media/hexView.ts` — the `HX` line command's real implementation:
     Monaco's view-zone API (`changeViewZones`/`addZone`/`removeZone`),
     the same "reserve space in the render, not the model" category of
@@ -708,11 +960,13 @@ commit/push again on your own initiative, only when asked.
     doesn't need a `FoldingRangeProvider` — just a DOM node per shown
     line. Deliberately NOT remapped through restructuring the way LABEL/
     EXCLUDE are (any `onDidChangeModelContent` just clears every zone).
+    Public `hideAll()` (added 2026-09-14, see Status above) lets
+    `RESET`/`RES` clear every shown zone too, not just an edit.
   - `media/colsView.ts` — the `COLS` line command's real implementation
     (added 2026-09-14), modeled directly on `hexView.ts`'s `HexView` —
     same view-zone mechanism, same "any edit clears every zone"
-    simplification — but with no counted form, since real ISPF's own
-    COLS takes no operand (see Status above).
+    simplification, same `hideAll()` for `RESET`/`RES` — but with no
+    counted form, since real ISPF's own COLS takes no operand.
   - `media/primaryCommand.ts` — `COMMAND ===>` bar command parsing/
     execution. `find`/`f`/`rfind`/`rf`, `change`/`c`, `sort`, `top`/`t`,
     `bottom`/`bot`, `locate`/`loc`/`l`, `exclude`/`x`, `reset`/`res`
@@ -726,9 +980,12 @@ commit/push again on your own initiative, only when asked.
     see Status above; `find`/`change` share scope-keyword parsing via
     `extractTrailingScope`, and `find`/`rfind` share direction-repeat
     state via module-level `lastFindNeedle`/`lastFindDirection`/
-    `lastFindColumnRange` — the last added 2026-09-14 alongside ISPF's
-    `FIND`/`CHANGE` column-range restriction, `extractColumnRange`/
-    `withinColumnRange`/`pickMatch`, see Status above). `undo`,
+    `lastFindColumnRange`/`lastFindWord` — the latter two added
+    2026-09-14 alongside ISPF's `FIND`/`CHANGE` column-range restriction
+    (`extractColumnRange`/`withinColumnRange`/`pickMatch`) and `WORD`
+    qualifier (`extractWordQualifier`/`WORD_SEPARATORS`, passed straight
+    through as Monaco's own `wordSeparators` find-API argument), see
+    Status above). `undo`,
     `cancel`/`can`, `save`, `end`/`pf3`, `reset lab`/`res lab` (-> action
     `resetLabels`), and (added 2026-09-14) `cut` and `paste`/`paste a`/
     `paste b` return `{kind:"forward", action}` for the provider to
@@ -738,7 +995,11 @@ commit/push again on your own initiative, only when asked.
     is the one `CommandOutcome` variant that carries extra payload
     (`line`/`before`) alongside `action` — `main.ts`'s forwarding handler
     spreads everything but `kind` into the posted message rather than
-    just `{action}`.
+    just `{action}`. `executePrimaryCommand`'s 5th parameter,
+    `clearViewZones` (added 2026-09-14, see Status above), is called by
+    plain `RESET`/`RES` to hide any shown `hx`/`cols` zones alongside its
+    existing un-hide-EXCLUDEd-lines job — `main.ts` wires it to both
+    `HexView`/`ColsView`'s `hideAll()`.
   - `media/excludeFolding.ts` — EXCLUDE/RESET/x/xx's real implementation:
     Monaco's public folding API (`registerFoldingRangeProvider` +
     `editor.fold`/`editor.unfoldAll` triggers), NOT the lower-level
@@ -1020,15 +1281,54 @@ real file in the installed extension:
   showing should make them all disappear; try it on a line with
   non-ASCII characters to see what the "masked to one byte" hex actually
   looks like (documented as not real UTF-8, just a peek).
-- COLS line command (new 2026-09-14, entirely unexercised): `cols` on a
+- COLS line command (new 2026-09-14; owner already tried this once and
+  hit the RES gap fixed in the "RESET now clears HX/COLS rulers too"
+  status entry above — re-verify with that fix in place): `cols` on a
   line shows a column ruler underneath it (`----+----1----+----2...`);
-  typing `cols` again on that same line hides it; the ruler's width
-  should span at least the longest line in the file (verify against a
-  file with a long line); typing directly into Monaco (or committing any
-  prefix-command batch) while a ruler is showing should make it
-  disappear, same as `hx`; there's no counted form — `cols3` should be
-  sent to the backend as an unknown command and error, not treated as
-  "show cols on 3 lines."
+  typing `cols` again on **that same line** (not the ruler's own row,
+  which has no gutter cell) hides it; running `RESET`/`RES` also hides
+  it (this is the new part — confirm it actually disappears now); the
+  ruler's width should span at least the longest line in the file
+  (verify against a file with a long line); typing directly into Monaco
+  (or committing any prefix-command batch) while a ruler is showing
+  should make it disappear, same as `hx`; there's no counted form —
+  `cols3` should be sent to the backend as an unknown command and error,
+  not treated as "show cols on 3 lines."
+- HX rulers also cleared by RESET (new 2026-09-14, same fix as COLS
+  above, entirely unexercised specifically for this): show `hx` on a
+  line, run `RESET`/`RES`, confirm the hex rows disappear (this used to
+  require retyping `hx` on the same line or making any edit — RES is a
+  new third way to clear it).
+- Gutter cells below a shown HX/COLS zone (bug fix, REVERTED AND
+  RE-FIXED 2026-09-14 — this is the third round on this exact issue, see
+  the two status entries above): show `cols` (or `hx`) on some line,
+  then type a line command (e.g. `d`, `.a`) into the gutter cell for the
+  line **immediately below** the ruler/hex rows and confirm it lands on
+  the correct real line, not shifted onto/near the ruler's own row —
+  verify for a few lines below it too, and after scrolling the zone
+  partially off-screen. This exact scenario was reported broken twice in
+  a row (once before any fix, once again after the first, wrong fix) —
+  confirm carefully rather than assuming it's fine this time.
+- Gutter Up/Down arrow navigation (new 2026-09-14, entirely unexercised):
+  focus a prefix cell, press Down — focus should move to the cell
+  directly below, at the same caret column (not reset to the start);
+  press Up to go back; try it at/near the top and bottom of the file
+  (should just stop, not error); try it right after scrolling so the
+  target cell isn't currently pooled — it should still work (scrolls the
+  target into view first); try it with a shown hx/cols zone in between
+  two lines, to make sure arrow-nav and the zone-positioning fix above
+  don't interact badly.
+- WORD qualifier for FIND/CHANGE (new 2026-09-14, entirely unexercised):
+  `find dcl word` matches only the whole word `dcl`, not `dcla`/`xdcl`;
+  `c dcl declare word all` changes every whole-word `dcl` to `declare`
+  — note this is NOT the same token order as the owner's own original
+  example (`c dcl word all declare`); flag to the owner whether the
+  documented order (old, new, WORD, scope) is acceptable or the original
+  phrasing was actually the intended syntax. Also verify: `word` combines
+  with a column range (`find 'x' word 8 10`); a bare `find`/`rfind`
+  repeat after a WORD-qualified FIND keeps requiring whole-word matches;
+  `find word` alone (one token) searches for the literal text "word",
+  not an empty WORD-qualified search.
 - FIND/CHANGE column-range restriction (new 2026-09-14, entirely
   unexercised): `f 'xxx' 8 10` only finds `xxx` where it lies entirely
   within columns 8-10, ignoring occurrences elsewhere on the line;
@@ -1041,6 +1341,14 @@ real file in the installed extension:
   search, NOT misinterpreted as a column-only command with an empty
   search string; quoting a numeric search string (`find '100' 8 10`)
   should let it combine with a real column range.
+- HELP primary command (new 2026-09-14, entirely unexercised): `help`/
+  `h` opens a new tab BESIDE the current one showing the command
+  reference; confirm it's a plain text tab (not another SPFVS custom
+  editor) and doesn't disturb the currently-open SPFVS file/cursor
+  position; running it again should open ANOTHER new tab (by design —
+  not reused/tracked); spot-check the listed syntax against a few
+  recently-added commands (WORD qualifier, COLS, CUT/PASTE) for drift
+  against `helpText.ts`'s hand-maintained content.
 
 ## Conventions
 

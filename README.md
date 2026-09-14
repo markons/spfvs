@@ -131,6 +131,14 @@ package itself was actually updated first.
 
 ## Supported prefix commands (MVP)
 
+Each prefix cell is a real, independent text input, but it also
+supports two ISPF-style navigation shortcuts so it doesn't feel like a
+plain isolated text box: **Up/Down arrow** moves focus to the cell for
+the line above/below (preserving the caret's column position), the
+classic ISPF convention of walking the prefix area with the cursor keys
+instead of the mouse or Tab; **Home** jumps to the `COMMAND ===>` bar
+(see below). Typing is still per-cell and uncommitted until `Enter`.
+
 | Code | Meaning |
 |---|---|
 | `d[n]` | delete n lines starting here (default 1) |
@@ -254,7 +262,12 @@ operand either — so it's toggle-only. The ruler spans the longest line
 currently in the document (with an 80-column floor for a short/empty
 file), since this project has no BOUNDS/record-length concept of its
 own to size it against (see "Known limitations"). Any document edit
-hides every currently-shown ruler, same as `hx`.
+hides every currently-shown ruler, same as `hx`. To remove a ruler:
+either retype `cols` on the **same line it's attached to** (the real
+line above the ruler — the ruler itself isn't a document line and has
+no gutter cell of its own to type into), or run the `RESET`/`RES`
+primary command, which clears every shown `hx`/`cols` zone in addition
+to its usual un-hide-EXCLUDEd-lines job.
 
 ## Primary commands
 
@@ -286,10 +299,12 @@ prefix command table above).
 | `find <text> last` / `f <text> last` | jump to the last match in the whole file |
 | `find <text> all` / `f <text> all` | jump to the first match and report the total match count |
 | `find <text> <c1> <c2> [scope]` / `f <text> <c1> <c2> [scope]` | only match text lying entirely within columns `c1`-`c2` (1-indexed, inclusive) |
-| `find` / `f` (no text) | repeat the last search, same as `rfind`, in the same direction and column range |
+| `find <text> word [c1 c2] [scope]` / `f <text> word [c1 c2] [scope]` | only match a whole word (flanked by non-alphanumeric characters or line start/end) |
+| `find` / `f` (no text) | repeat the last search, same as `rfind`, in the same direction, WORD setting, and column range |
 | `rfind` / `rf` | repeat the last search (ISPF's PF5) |
 | `change <old> <new> [scope]` / `c <old> <new> [scope]` | replace one match — `scope` is `first`/`last`/`prev`/`next` (default) — or, with `all`, every match |
 | `change <old> <new> <c1> <c2> [scope]` / `c <old> <new> <c1> <c2> [scope]` | same, but only within columns `c1`-`c2` |
+| `change <old> <new> word [c1 c2] [scope]` / `c <old> <new> word [c1 c2] [scope]` | same, but `old` must match a whole word |
 | `sort` | sort all lines, whole-line comparison, ascending |
 | `sort <c1> <c2> [a\|d]` | sort by the column range `c1`-`c2` (1-indexed, inclusive); `d` for descending |
 | `cut` | resolve whatever `c`/`cc`/`m`/`mm` mark is currently pending: copy or move it to the shared clipboard |
@@ -302,13 +317,22 @@ prefix command table above).
 | `exclude <text>` / `x <text>` | hide lines containing text (view-only, no edit) |
 | `exclude all` / `x all` | hide every line |
 | `exclude .a .b` / `x .a .b` | hide the range between two labels, inclusive (either order) |
-| `reset` / `res` | show all excluded lines again (both `EXCLUDE`- and `x`/`xx`-hidden), but leave labels alone |
+| `reset` / `res` | show all excluded lines again (both `EXCLUDE`- and `x`/`xx`-hidden) and hide any shown `hx`/`cols` rulers, but leave labels alone |
 | `reset lab` / `res lab` | clear every LABEL (does *not* un-hide anything) |
 | `undo` | undo one edit |
 | `undo all` | discard all unsaved changes, reverting to the on-disk version |
 | `save` | save the file |
 | `cancel` / `can` | discard all unsaved changes and close the editor |
 | `end` / `pf3` | save and close the editor |
+| `help` / `h` | open a quick-reference listing of every implemented command, in a new tab beside the current one |
+
+**`HELP`/`H`** opens a plain, static text summary of every implemented
+prefix and primary command's syntax (`extension/src/helpText.ts`) as a
+new, ordinary VS Code tab beside the current one — not another SPFVS
+editor, just a scrollable/searchable read-only-in-spirit text buffer
+(nothing stops editing/saving it, but nothing reads it back either).
+It's a quick reference, not a replacement for this README — keep both
+in sync when a command's syntax changes.
 
 **`CUT`/`PASTE` workflow:** mark one or more lines in the gutter with
 `c[n]`/`cc`...`cc` (copy) or `m[n]`/`mm`...`mm` (move), commit that batch,
@@ -354,6 +378,20 @@ quote a numeric-looking search string (`find '100' 8 10`) to force it to
 be read as text rather than as columns. A bare `FIND`/`RFIND` repeat
 reuses whatever column range (if any) the last explicit `FIND` used, the
 same way it reuses the search text and direction.
+
+**`WORD`-qualified `FIND`/`CHANGE`** (ISPF's own `FIND string WORD` /
+`CHANGE old new WORD` form): appending `WORD` right after the search
+text (and, for `CHANGE`, the replacement text) — before any column
+range or scope keyword — restricts matches to a **whole word**: the
+match must be flanked by a non-alphanumeric character (or line start/
+end) on both sides, not sit inside a larger run of word characters.
+`c dcl declare word all` changes every whole-word `dcl` to `declare`
+without touching `dcla`, `xdcl`, etc. Combines with a column range
+(`find 'x' word 8 10`) and any scope (`c old new word all`); a bare
+`FIND`/`RFIND` repeat reuses the last explicit `FIND`'s WORD setting too.
+Same one-token disambiguation as the scope keyword and column range: a
+literal one-word search that happens to spell `word` needs at least one
+more token before it, or it's read as literal text.
 
 `SORT` reorders **every** line in the file, ignoring exclusion state —
 real ISPF sorts only the currently-displayed (non-excluded) lines and

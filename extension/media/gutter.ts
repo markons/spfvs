@@ -186,6 +186,15 @@ export class PrefixGutter {
         this.inputs.set(line, input);
         this.container.appendChild(input);
       }
+      // Plain getTopForLineNumber(line) (NOT includeViewZones=true) is
+      // correct here — Monaco's own linesLayout.getVerticalOffsetFor-
+      // LineNumber already counts a zone for the line immediately after
+      // it when includeViewZones is left at its false default; passing
+      // true instead EXCLUDES that zone for exactly that one line, which
+      // was tried once (2026-09-14) and made that line's cell render on
+      // top of the zone instead of below it — the opposite of a fix. See
+      // CLAUDE.md's status entry for the full derivation from Monaco's
+      // own source before changing this again.
       const top = this.editor.getTopForLineNumber(line) - this.editor.getScrollTop();
       input.style.transform = `translateY(${top}px)`;
       input.style.height = `${lineHeight}px`;
@@ -229,9 +238,42 @@ export class PrefixGutter {
       } else if (e.key === "Home") {
         e.preventDefault();
         this.options.onJumpToCommandBar();
+      } else if (e.key === "ArrowUp") {
+        e.preventDefault();
+        this.focusLine(line - 1, input.selectionStart);
+      } else if (e.key === "ArrowDown") {
+        e.preventDefault();
+        this.focusLine(line + 1, input.selectionStart);
       }
     });
     return input;
+  }
+
+  /** Moves focus to the prefix cell for `line`, preserving the caret's
+   * column position — real ISPF's own convention of walking up/down the
+   * prefix (line-command) area with the cursor keys, which a plain
+   * `<input>` has no native equivalent for (arrow keys do nothing useful
+   * in a single-line text box otherwise, so intercepting them
+   * unconditionally is safe, unlike Home in the main editor). If the
+   * target line's cell isn't currently pooled (e.g. right at the edge of
+   * the visible-range buffer), `revealLine` scrolls it into view first —
+   * `layout()` fires synchronously off that scroll and creates it. */
+  private focusLine(line: number, caretPos: number | null): void {
+    if (line < 1) return;
+    const model = this.editor.getModel();
+    if (model && line > model.getLineCount()) return;
+    let input = this.inputs.get(line);
+    if (!input) {
+      this.editor.revealLine(line);
+      this.layout();
+      input = this.inputs.get(line);
+    }
+    if (!input) return;
+    input.focus();
+    if (caretPos !== null) {
+      const pos = Math.min(caretPos, input.value.length);
+      input.setSelectionRange(pos, pos);
+    }
   }
 
   private commit(): void {

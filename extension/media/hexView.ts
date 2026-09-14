@@ -76,6 +76,17 @@ export class HexView {
     this.zoneIds.delete(line);
   }
 
+  /** Hides every currently-shown hex zone at once — called both
+   * internally on any document edit, and by the `RESET`/`RES` primary
+   * command (see primaryCommand.ts), since a view-only toggle like this
+   * has no document edit of its own to trigger the internal cleanup:
+   * without this, `RES` (which already clears EXCLUDE'd lines) would
+   * leave any shown hex rows behind, looking like they can't be turned
+   * off at all. */
+  hideAll(): void {
+    this.clearAll();
+  }
+
   private clearAll(): void {
     if (this.zoneIds.size === 0) return;
     this.editor.changeViewZones((accessor) => {

@@ -1,6 +1,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import { BackendClient, BackendResponse, PendingMark, RawCommand } from "./backendClient";
+import { HELP_TEXT } from "./helpText";
 
 interface MonacoChange {
   startLine: number;
@@ -236,6 +237,18 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
         // "setLabels" handler). RESET LAB only ever touches labels.
         webviewPanel.webview.postMessage({ type: "setLabels", labels: {} });
         break;
+      case "help": {
+        // A plain untitled document in VS Code's own text editor (NOT
+        // another SPFVS custom editor instance) beside the current one —
+        // simplest way to show a scrollable, searchable, multi-line
+        // reference without cramming it into the single-line COMMAND
+        // ===> status message. Opened fresh each time rather than reused/
+        // tracked, since it's cheap and stale content is never a concern
+        // (HELP_TEXT is static, not derived from live document state).
+        const helpDoc = await vscode.workspace.openTextDocument({ content: HELP_TEXT, language: "plaintext" });
+        await vscode.window.showTextDocument(helpDoc, { viewColumn: vscode.ViewColumn.Beside, preview: true });
+        break;
+      }
     }
   }
 

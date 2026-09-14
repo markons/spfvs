@@ -62,6 +62,19 @@ export class ColsView {
     this.zoneIds.delete(line);
   }
 
+  /** Hides every currently-shown ruler at once — called both internally
+   * on any document edit, and by the `RESET`/`RES` primary command (see
+   * primaryCommand.ts). Owner reported a ruler "cannot be revoked...
+   * even after a res command" — retyping `cols` on the SAME originating
+   * line does toggle it off, but `RES` (which already clears EXCLUDE'd
+   * lines) previously left any shown ruler behind since a view-only
+   * toggle like this has no document edit of its own to trigger the
+   * internal cleanup, which reads exactly like "can't be removed at
+   * all" if that's the command you reach for. */
+  hideAll(): void {
+    this.clearAll();
+  }
+
   private clearAll(): void {
     if (this.zoneIds.size === 0) return;
     this.editor.changeViewZones((accessor) => {
