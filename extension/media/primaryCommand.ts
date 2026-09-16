@@ -20,11 +20,17 @@ interface Handled {
  * model here. HELP is forwarded too, purely because opening a new
  * document/tab (`vscode.workspace.openTextDocument`/`showTextDocument`)
  * is an extension-host-only API — it doesn't touch the current document
- * at all. */
+ * at all. Any command word that doesn't match one of the built-ins below
+ * is ALSO forwarded now (as a `"macro"` action) rather than reported as
+ * an error right here — macro files live on the filesystem, which this
+ * sandboxed webview has no access to, so the extension host has to be
+ * the one to decide whether it's a real macro or genuinely unknown (see
+ * ispfEditorProvider.ts's `handleMacroAction`, macros.ts). */
 export type CommandOutcome =
   | ({ kind: "handled" } & Handled)
   | { kind: "forward"; action: "undo" | "undoAll" | "cancel" | "save" | "end" | "resetLabels" | "cut" | "help" }
-  | { kind: "forward"; action: "paste"; line: number; before: boolean };
+  | { kind: "forward"; action: "paste"; line: number; before: boolean }
+  | { kind: "forward"; action: "macro"; name: string; args: string[]; cursorLine: number };
 
 /** Notifies the extension host that the webview's own EXCLUDE/RESET just
  * changed which lines are hidden, so its excluded-lines state (kept in
@@ -601,7 +607,16 @@ export async function executePrimaryCommand(
       clearViewZones();
       return { kind: "handled", message: "all lines displayed" };
     }
-    default:
-      return { kind: "handled", message: `unknown primary command '${parts[0]}'`, isError: true };
+    default: {
+      // Not a built-in — might be a macro (see this file's module doc
+      // comment on the CommandOutcome type). The extension host decides:
+      // it looks for `.spfvs/macros/<name>.py` and either runs it or
+      // reports "unknown primary command" itself, since this webview has
+      // no filesystem access to check. cursorLine travels along for the
+      // same reason PASTE's does — ctx.cursor_line needs a real value at
+      // invocation time, and only Monaco (here) knows it.
+      const pos = editor.getPosition();
+      return { kind: "forward", action: "macro", name: parts[0], args: rest, cursorLine: pos?.lineNumber ?? 1 };
+    }
   }
 }

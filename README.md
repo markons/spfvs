@@ -154,10 +154,12 @@ instead of the mouse or Tab; **Home** jumps to the `COMMAND ===>` bar
 | `b` | destination marker: before this line — same as `a` |
 | `x[n]` | EXCLUDE: hide n lines starting here from view (default 1) |
 | `xx`...`xx` | EXCLUDE the block between two `xx` markers from view |
-| `)`, `))`, ... / `>`, `>>`, ... | SHIFT this line's text right by 2 columns per repeated character |
-| `)n` / `>n` | SHIFT this line's text right by exactly n columns |
-| `(`, `((`, ... / `<`, `<<`, ... | SHIFT this line's text left by 2 columns per repeated character |
-| `(n` / `<n` | SHIFT this line's text left by exactly n columns |
+| `)` | Column Shift Right this line by the default width (2 columns) |
+| `)n` | Column Shift Right this line by exactly n columns |
+| `))`...`))` | Column Shift Right the whole block between two `))` markers (a count on either marker, e.g. `))3`, overrides the default for the whole block — closing wins if both specify one) |
+| `(` | Column Shift Left this line by the default width (2 columns) |
+| `(n` | Column Shift Left this line by exactly n columns |
+| `((`...`((` | Column Shift Left the whole block between two `((` markers (same count rule as `))`...`))`) |
 | `.name` | LABEL: assign `name` (1-8 chars, must start with a letter) to this line |
 | `.` | clear whatever label is on this line |
 | `uc` | UPPERCASE this line's text |
@@ -192,16 +194,32 @@ already pending, etc.) rejects the whole batch and leaves the offending
 gutter cells in place with a tooltip explaining why, instead of partially
 applying it.
 
-`)`/`(` and their `>`/`<` aliases physically edit the line, unlike every
-other command on this page below (labels/exclude are view-only, the rest
-restructure whole lines): shifting right prepends blank columns, and
-shifting left **blindly drops** the leftmost n characters, blank or not —
-matching real ISPF, where shifting left too far discards actual text
-rather than stopping politely at the first non-blank column. `2 columns
-per repeated character` is a documented default this project chose (the
-2 isn't independently verified against IBM's own default, which is
-profile-configurable); an explicit `)n`/`(n`/`>n`/`<n` count always
-overrides it with an exact column number instead of a multiple.
+`)`/`(` (IBM calls this **Column Shift**) physically edit the line text,
+unlike every other command on this page below (labels/exclude are
+view-only, the rest restructure whole lines rather than their content):
+shifting right prepends blank columns, and shifting left **blindly
+drops** the leftmost n characters, blank or not — matching real ISPF,
+where shifting left too far discards actual text rather than stopping
+politely at the first non-blank column. The default width of 2 columns
+is IBM's own documented default (not profile-configurable in this
+project — real ISPF lets it vary per profile); an explicit `)n`/`(n`
+count overrides it with an exact column number instead. `))`...`))` /
+`((`...`((` are a real ISPF construct (not this project's invention):
+pairing the doubled character on the first and last line of a range
+shifts every line in between by the same amount, exactly like
+`dd`...`dd` marks a block for delete.
+
+**`>`/`<` are intentionally NOT implemented.** They look similar but are
+a genuinely different real ISPF command, **Data Shift** — it moves "the
+body of a program statement" without disturbing its label/comment
+fields, and stops with an `==ERR>` flag instead of truncating once a
+shift would exceed the file's BOUNDS setting. Both "label/comment
+fields" (language-specific — well-defined for COBOL's fixed columns,
+undefined for a generic multi-language editor) and BOUNDS (see "Known
+limitations") don't exist in this project, so `>`/`<` are left as plain,
+unrecognized line commands rather than faked as aliases of `)`/`(` —
+an earlier version of this project did alias them, which was incorrect;
+that's been removed.
 
 Like a LABEL, `x`/`xx` don't restructure the document — hiding a line is a
 view-only effect, persistent editor-session state that follows its line
@@ -427,6 +445,279 @@ since there's no per-document API for "step back one undo entry" — the
 other actions (`UNDO ALL`, `SAVE`, `CANCEL`, `END`, `RESET LAB`) address
 the document/extension-host state directly and don't depend on focus.
 
+## Edit macros
+
+Typing anything in `COMMAND ===>` that isn't a built-in primary command
+looks for a matching **edit macro** — SPFVS's answer to real ISPF's own
+REXX edit macros, written in Python instead. This is **Phase 1** of a
+larger macro-support design — see "Phase 1 limitations" at the end of
+this section for what's deliberately not built yet.
+
+### Installing a macro
+
+1. **Open the macro's workspace as a VS Code folder** (File → Open
+   Folder), not just a loose file — macro lookup resolves a file's
+   *workspace folder* to find its macros, so there has to be one open.
+2. Create a `.spfvs/macros/` folder at that workspace's root, if it
+   doesn't already exist.
+3. Add a file named `<name>.py` — **lowercase**, matching how every
+   other command word is already matched case-insensitively — where
+   `<name>` is what you'll type to invoke it. `todocomment.py` is
+   invoked by typing `todocomment`.
+4. The file must define one module-level function:
+   ```python
+   def run(ctx, args):
+       ...
+   ```
+   `ctx` is described below; `args` is the list of tokens typed after
+   the macro's name (e.g. typing `foo arg1 arg2` calls
+   `run(ctx, ["arg1", "arg2"])`).
+
+No separate registration step, no restart required — the file is read
+fresh every time the macro is invoked.
+
+### Running a macro
+
+1. Open a file **from that same workspace** via **Reopen Editor
+   With... → SPFVS** (right-click the file, or use the Command Palette)
+   — SPFVS is a per-file custom editor, so this has to be done
+   explicitly per file.
+2. Click into the **`COMMAND ===>` bar inside the SPFVS editor pane
+   itself** (not VS Code's own Command Palette — a different thing
+   entirely) and type the macro's name, optionally followed by
+   arguments, then press Enter.
+3. **The workspace must be trusted** (VS Code's own Workspace Trust) —
+   a macro is arbitrary Python running with your own file/process
+   privileges, the same trust model real ISPF macros have (they can
+   shell out too, via `ADDRESS TSO`), so opening an untrusted folder can
+   never silently make its macros runnable. An untrusted workspace
+   reports a clear "blocked" message instead of running the macro.
+4. If no `.spfvs/macros/<name>.py` exists, you get the same "unknown
+   primary command" error any other typo produces. A macro name that
+   collides with a real built-in command (`save`, `find`, etc.) is
+   never reachable — built-ins always win.
+
+### The `ctx` object (`EditContext`)
+
+`ctx` is **not** the file's text as one string — it's a small API bound
+to a snapshot of the document taken the moment the macro was invoked
+(all lines, plus the cursor's current line number). The macro only ever
+touches that snapshot through `ctx`'s methods; whatever it looks like
+once `run()` returns is written back to the real document.
+
+| Member | Meaning |
+|---|---|
+| `ctx.line_count` | number of lines in the snapshot |
+| `ctx.first_line` / `ctx.last_line` | always `1` / `line_count` |
+| `ctx.cursor_line` | read or set the cursor's line (moves the real cursor once the macro finishes) |
+| `ctx.get_line(n)` / `ctx.set_line(n, text)` | read/replace one line (`change_line` is an alias for `set_line`) |
+| `ctx.find_all(text)` | every line currently containing `text` (plain substring, not regex) as a list of `{line, text}` matches — a snapshot taken when called, not a live re-scan (see its own docstring for the exact caveat if you mutate a matched line and then re-read the same result list) |
+| `ctx.resolve_label(name)` | the line number for an ISPF label — `.name` (leading `.` optional, case-insensitive), or the reserved `.ZFIRST`/`.ZLAST`/`.ZCSR` (first line / last line / the cursor's *current* line, computed fresh, not stored) — `None` if `name` isn't set and isn't reserved |
+| `ctx.set_label(name, line)` | assign `name` to `line` — same rules as a gutter `.name` commit (1-8 letters/digits, must start with a letter, folded to uppercase, `Z`-prefixed names rejected as reserved). Replaces any other label already on that line (one label per line); assigning an existing name to a new line moves it |
+| `ctx.clear_label(name)` | remove `name` if it's currently set — a no-op, not an error, if it isn't |
+| `ctx.insert_after(n, text)` / `ctx.insert_before(n, text)` | insert a new line right after/before line `n` (`insert_after(ctx.last_line, text)` appends; `insert_before(ctx.first_line, text)` prepends). Changes `line_count`; `cursor_line` isn't auto-moved, only clamped back into range if the document shrank/moved past it. Existing labels are remapped to follow the shift, same as a gutter batch's own restructuring |
+| `ctx.delete_line(n)` / `ctx.delete_lines(start, end)` | remove one line, or an inclusive range in one operation. A label on a deleted line is dropped; labels after it shift up to follow |
+| `ctx.message(text)` | queues a line of status text, shown once the macro finishes, alongside anything printed with a plain `print()` |
+
+A short, single-line result shows directly in the `COMMAND ===>` bar's
+status area, same as any other primary command's feedback. A **long or
+multi-line** result (more than ~120 characters, or containing a
+newline) goes to a **"SPFVS Macros" output channel** instead — that
+status area is a single truncating line, so anything longer would
+otherwise render as one collapsed, silently-cut-off line — with a short
+one-line summary left in the status bar pointing you at it. The output
+channel opens automatically (without stealing focus from the editor)
+whenever a macro produces one of these longer results.
+
+### Example: translating a REXX macro
+
+The REXX `ISREDIT`/`ADDRESS`/`RC`-checking idioms mostly disappear in
+translation — Python already has iterators and real return values, so
+several REXX "features" (RC-driven `DO WHILE` loops, `FIND FIRST`/`FIND
+NEXT` repeat-state, reading `.ZLAST` like a variable) exist only to work
+around REXX not having them, and just aren't needed in Python at all.
+
+Original REXX:
+
+```rexx
+/* REXX */
+/* ISPF EDIT MACRO - simple line processing demonstration */
+ADDRESS ISREDIT
+"NUMBER"
+"STATS"
+parse var RC .
+"CURSOR = 0"
+"FIND FIRST TODO"
+do while RC = 0
+    "CHANGE TODO TODO ALL"
+    "FIND NEXT TODO"
+end
+"FIND FIRST '/*'"
+do while RC = 0
+    "CHANGE FIRST '/*' 'COMMENT: /*'"
+    "FIND NEXT '/*'"
+end
+"NUMBER"
+"GET_LINES .ZLAST"
+say "ISPF EDIT MACRO FINISHED"
+say "Lines in member:" .ZLAST
+exit 0
+```
+
+Python translation, shipped as `.spfvs/macros/todocomment.py` (try it —
+open this repo in SPFVS and type `todocomment`):
+
+```python
+def run(ctx, args):
+    # FIND FIRST/NEXT TODO + RC-checked loop -> a plain iterator. As
+    # literally written the REXX changes "TODO" to "TODO" (a no-op) on
+    # every match; kept as-is to mirror the source faithfully.
+    for match in ctx.find_all("TODO"):
+        ctx.change_line(match.line, match.text.replace("TODO", "TODO"))
+
+    # FIND FIRST/NEXT '/*' + CHANGE FIRST -> replace just the first
+    # "/*" on each matching line with "COMMENT: /*".
+    for match in ctx.find_all("/*"):
+        ctx.change_line(match.line, match.text.replace("/*", "COMMENT: /*", 1))
+
+    # NUMBER / GET_LINES .ZLAST + the two SAY statements.
+    ctx.message(f"ISPF EDIT MACRO FINISHED\nLines in member: {ctx.line_count}")
+```
+
+### Example: plain line-by-line iteration
+
+`find_all()` is pattern-based; for a macro that needs to look at *every*
+line regardless of content (reformatting, column checks, a running
+tally), iterate `ctx.first_line`..`ctx.last_line` directly — the
+Python equivalent of REXX's `DO i = 1 TO .ZLAST` / `"LINE" i` loop:
+
+```rexx
+"(LASTLINE) = LINENUM .ZLAST"
+do i = 1 to LASTLINE
+    "(CURLINE) = LINE" i
+    /* ... inspect/modify CURLINE ... */
+    "LINE" i "=" newtext
+end
+```
+
+```python
+def run(ctx, args):
+    changed = 0
+    for i in range(ctx.first_line, ctx.last_line + 1):
+        text = ctx.get_line(i)
+        stripped = text.rstrip()
+        if stripped != text:
+            ctx.set_line(i, stripped)
+            changed += 1
+    ctx.message(f"stripped trailing whitespace from {changed} of {ctx.line_count} line(s)")
+```
+
+### Example: resolving and jumping to a label
+
+Shipped as `.spfvs/macros/showlabel.py` — set a label with `.foo` in the
+gutter, commit that batch, then type `showlabel foo`:
+
+```python
+def run(ctx, args):
+    lines = [
+        f".ZFIRST -> line {ctx.resolve_label('.ZFIRST')}",
+        f".ZLAST  -> line {ctx.resolve_label('.ZLAST')}",
+        f".ZCSR   -> line {ctx.resolve_label('.ZCSR')} (the cursor's line when this macro started)",
+    ]
+    if args:
+        name = args[0]
+        target = ctx.resolve_label(name)
+        clean_name = name.lstrip(".")
+        if target is None:
+            lines.append(f".{clean_name} -> not set")
+        else:
+            lines.append(f".{clean_name} -> line {target} (jumping there)")
+            ctx.cursor_line = target  # real ISPF's LOCATE .label, in one step
+    ctx.message("\n".join(lines))
+```
+
+A bare `showlabel` (no argument) just reports the three reserved names;
+`showlabel <name>` also resolves and jumps to a real label, or reports
+`not set` if it doesn't exist.
+
+### Example: setting and clearing a label
+
+Shipped as `.spfvs/macros/setlabel.py`:
+
+```python
+def run(ctx, args):
+    if not args:
+        ctx.message("usage: setlabel <name> [<line> | clear]")
+        return
+
+    name = args[0]
+    clean_name = name.lstrip(".").upper()
+
+    if len(args) > 1 and args[1].lower() == "clear":
+        ctx.clear_label(name)
+        ctx.message(f".{clean_name} cleared")
+        return
+
+    target = int(args[1]) if len(args) > 1 else ctx.cursor_line
+    ctx.set_label(name, target)
+    ctx.message(f".{clean_name} -> line {target}")
+```
+
+`setlabel foo` assigns `.FOO` to the cursor's current line; `setlabel
+foo 10` assigns it to line 10 instead; `setlabel foo clear` removes it.
+No document edit happens here at all — the label shows up in the gutter
+immediately.
+
+### Example: insert, delete, and copy/move by composition
+
+There's no dedicated `copy`/`move` method — `insert_after`/
+`insert_before` plus `get_line`/`delete_line` compose into both.
+Shipped as `.spfvs/macros/duplicateline.py`:
+
+```python
+def run(ctx, args):
+    mode = args[0].lower() if args else "after"
+    source_line = ctx.cursor_line
+    text = ctx.get_line(source_line)
+
+    if mode == "move":
+        # Copy to the end, then remove the original -- a "move" is just
+        # insert_after + delete_line, no dedicated method needed.
+        ctx.insert_after(ctx.last_line, text)
+        ctx.delete_line(source_line)
+        ctx.message(f"moved line {source_line} to the end (now line {ctx.last_line})")
+        return
+
+    if mode == "before":
+        ctx.insert_before(source_line, text)
+    else:
+        ctx.insert_after(source_line, text)
+    ctx.message(f"duplicated line {source_line}")
+```
+
+`duplicateline` duplicates the cursor's line right after it;
+`duplicateline before` duplicates it before instead; `duplicateline
+move` moves it to the end of the file rather than copying it.
+
+### Phase 1 limitations
+
+- Insert/delete are single-line (or, for delete, a single inclusive
+  range) primitives — there's no dedicated `copy`/`move` call, just
+  composing `get_line`/`insert_after`/`insert_before`/`delete_line` (see
+  the example above). `cursor_line` is clamped back into range after a
+  delete shrinks past it, but never auto-tracks WHERE its original line
+  ended up — a macro that cares should set it explicitly.
+- No interactivity — a macro gets everything in one call and returns
+  once; it can't prompt mid-run the way a real ISPF panel-display macro
+  can.
+- Labels can now be both read (`ctx.resolve_label`) and set/cleared
+  (`ctx.set_label`/`ctx.clear_label`), and are correctly remapped
+  through `insert_after`/`insert_before`/`delete_line`/`delete_lines`.
+  Still no access to `EXCLUDE`d lines or the `CUT`/`PASTE` clipboard
+  from inside a macro at all.
+- Only the workspace-local `.spfvs/macros/` location is searched — no
+  global/personal macro folder yet.
+
 ## Known limitations / follow-up work
 
 - Syntax coloring beyond Monaco's built-ins is implemented only for PL/I
@@ -467,6 +758,13 @@ the document/extension-host state directly and don't depend on focus.
   are also purely visual state, gone the instant the document changes at
   all (not remapped like LABEL/EXCLUDE), and never persist across
   reopening the file.
+- No `BOUNDS` setting, and no `>`/`<` Data Shift line command (see the
+  SHIFT section above) — both need each other (Data Shift stops at
+  BOUNDS rather than truncating) and Data Shift additionally needs a
+  language-specific "label field"/"comment field" definition this
+  project has no generic way to provide. Column Shift (`)`/`(`,
+  including the real block form `))`/`((`) is unaffected and fully
+  implemented.
 - No Monaco web worker is configured (`editor.api` core only, no
   `vs/language/*` rich services) — Monaco falls back to main-thread
   computation for anything that would normally use one, which is fine

@@ -2,6 +2,7 @@ import * as vscode from "vscode";
 import * as path from "path";
 import { BackendClient, BackendResponse, PendingMark, RawCommand } from "./backendClient";
 import { HELP_TEXT } from "./helpText";
+import { findMacroFile, isWorkspaceTrustedForMacros } from "./macros";
 
 interface MonacoChange {
   startLine: number;
@@ -28,6 +29,14 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
   // document" (undo/redo, another editor, git) without echoing our own
   // edits back into the webview's Monaco model.
   private readonly appliedByUs = new Set<number>();
+  // A macro's message (ctx.message()/print() output — see macros.py)
+  // can be arbitrarily long or multi-line, but the COMMAND ===> bar's
+  // own status span is `white-space: nowrap` + `text-overflow: ellipsis`
+  // — a single truncating line, the same as every OTHER primary
+  // command's feedback. Long/multi-line macro output goes here instead
+  // (see reportMacroResult) so it's actually readable rather than
+  // silently cut off.
+  private readonly macroOutputChannel: vscode.OutputChannel;
 
   public static register(context: vscode.ExtensionContext): vscode.Disposable {
     const provider = new IspfEditorProvider(context);
@@ -41,6 +50,8 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
     const pythonPath = vscode.workspace.getConfiguration("spfvs").get<string>("pythonPath", "python");
     this.backend = new BackendClient(pythonPath);
     context.subscriptions.push({ dispose: () => this.backend.dispose() });
+    this.macroOutputChannel = vscode.window.createOutputChannel("SPFVS Macros");
+    context.subscriptions.push(this.macroOutputChannel);
   }
 
   public async resolveCustomTextEditor(
@@ -172,6 +183,21 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
                 if (expectedVersion !== null) pendingBatchEditVersions.add(expectedVersion);
               }
             );
+          } else if (message.action === "macro") {
+            await this.handleMacroAction(
+              document,
+              webviewPanel,
+              message.name as string,
+              message.args as string[],
+              message.cursorLine as number,
+              labels,
+              pendingMark,
+              (updatedLabels, updatedPendingMark, expectedVersion) => {
+                labels = updatedLabels;
+                pendingMark = updatedPendingMark;
+                if (expectedVersion !== null) pendingBatchEditVersions.add(expectedVersion);
+              }
+            );
           } else {
             await this.handlePrimaryAction(document, webviewPanel, message.action as string, () => {
               labels = {};
@@ -250,6 +276,109 @@ export class IspfEditorProvider implements vscode.CustomTextEditorProvider {
         break;
       }
     }
+  }
+
+  /** Runs a `.spfvs/macros/<name>.py` edit macro (Phase 1 of the
+   * macro-support design — see macros.py's module docstring). Since
+   * `EditContext` can now set/clear labels (added 2026-09-16, alongside
+   * insert/delete-line support), a macro's edit can no longer go through
+   * the `appliedByUs` ordinary-Monaco-edit path — that path
+   * UNCONDITIONALLY drops labels afterward (see the change listener
+   * above), which would silently discard a macro's own `set_label()`/
+   * `clear_label()` result the instant it was applied. Uses the SAME
+   * `pendingBatchEditVersions` pattern `handlePrefixCommands`/
+   * `handleClipboardAction` use instead: `onStateResolved` updates the
+   * caller's `labels` (and `pendingMark`, defensively cleared — a
+   * macro's restructuring isn't remapped through it the way a gutter
+   * batch's is) BEFORE the edit is applied, so by the time the change
+   * listener fires, the state it echoes back to the webview is already
+   * correct.
+   *
+   * A macro that only calls `set_label`/`clear_label`, with no line-text
+   * change at all, produces `newText === document.getText()` — the edit
+   * is skipped (same "don't create a no-op undo entry" reasoning as
+   * `handleClipboardAction`'s non-destructive-copy case), but the
+   * updated labels still need to reach the webview's gutter display, so
+   * a `setLabels` message is pushed directly in that branch rather than
+   * relying on a `setContent` that isn't coming. */
+  private async handleMacroAction(
+    document: vscode.TextDocument,
+    webviewPanel: vscode.WebviewPanel,
+    name: string,
+    args: string[],
+    cursorLine: number,
+    labels: Record<string, number>,
+    pendingMark: PendingMark | null,
+    onStateResolved: (
+      labels: Record<string, number>,
+      pendingMark: PendingMark | null,
+      expectedDocVersion: number | null
+    ) => void
+  ): Promise<void> {
+    if (!isWorkspaceTrustedForMacros()) {
+      this.reportMacroResult(webviewPanel, name, `macro '${name}' blocked: this workspace isn't trusted (see VS Code's Workspace Trust)`, true);
+      return;
+    }
+    const macroPath = findMacroFile(document, name);
+    if (!macroPath) {
+      // No matching macro file — this is the SAME message the webview
+      // used to produce itself for any unrecognized command word,
+      // before macro lookup existed; preserved verbatim so a genuine
+      // typo still reads exactly as it always has.
+      this.reportMacroResult(webviewPanel, name, `unknown primary command '${name}'`, true);
+      return;
+    }
+    const lines: string[] = [];
+    for (let i = 0; i < document.lineCount; i++) lines.push(document.lineAt(i).text);
+    const result = await this.backend.runMacro(macroPath, lines, cursorLine, args, labels);
+    if (!result.ok || result.lines === null) {
+      this.reportMacroResult(webviewPanel, name, `macro '${name}' failed: ${result.error ?? "unknown error"}`, true);
+      return;
+    }
+    const newLabels = result.labels ?? labels;
+    const eol = document.eol === vscode.EndOfLine.CRLF ? "\r\n" : "\n";
+    const newText = result.lines.join(eol);
+    if (newText !== document.getText()) {
+      const fullRange = new vscode.Range(0, 0, document.lineCount, 0);
+      const edit = new vscode.WorkspaceEdit();
+      edit.replace(document.uri, fullRange, newText);
+      onStateResolved(newLabels, null, document.version + 1);
+      await vscode.workspace.applyEdit(edit);
+    } else {
+      onStateResolved(newLabels, pendingMark, null);
+      webviewPanel.webview.postMessage({ type: "setLabels", labels: newLabels });
+    }
+    if (result.cursorLine !== null) {
+      webviewPanel.webview.postMessage({ type: "setCursor", line: result.cursorLine });
+    }
+    this.reportMacroResult(webviewPanel, name, result.message || `macro '${name}' completed`, false);
+  }
+
+  /** A macro's message (`ctx.message()`/`print()` output, or an error)
+   * can be arbitrarily long or multi-line — the COMMAND ===> bar's
+   * status span is a single `nowrap`/`text-overflow: ellipsis` line,
+   * same as every other primary command's feedback, so anything long
+   * would otherwise render as one collapsed, silently-truncated line
+   * (newlines included — CSS `nowrap` treats them as plain whitespace).
+   * Long/multi-line output goes to the "SPFVS Macros" output channel
+   * instead, revealed (without stealing focus) alongside a short
+   * one-line summary in the status bar; anything that already fits
+   * shows exactly as before, unchanged. */
+  private reportMacroResult(webviewPanel: vscode.WebviewPanel, name: string, message: string, isError: boolean): void {
+    const isLong = message.includes("\n") || message.length > 120;
+    if (!isLong) {
+      webviewPanel.webview.postMessage({ type: "primaryActionResult", message, isError });
+      return;
+    }
+    this.macroOutputChannel.appendLine(`[${name}] ${message}`);
+    this.macroOutputChannel.show(true);
+    const firstLine = message.split("\n", 1)[0];
+    const summary = firstLine.length > 80 ? `${firstLine.slice(0, 80)}…` : firstLine;
+    webviewPanel.webview.postMessage({
+      type: "primaryActionResult",
+      message: `${summary} — see "SPFVS Macros" output for full result`,
+      isError,
+    });
   }
 
   /** Replaces the document's content with what's currently on disk,

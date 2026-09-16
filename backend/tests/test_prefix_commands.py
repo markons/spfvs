@@ -339,11 +339,6 @@ def test_shift_right_default_width():
     assert_ok(result, ["  abc", "def"])
 
 
-def test_shift_right_double_is_twice_the_default_width():
-    result = run(["abc", "def"], [(1, "))")])
-    assert_ok(result, ["    abc", "def"])
-
-
 def test_shift_right_explicit_column_count():
     result = run(["abc", "def"], [(1, ")5")])
     assert_ok(result, ["     abc", "def"])
@@ -360,18 +355,24 @@ def test_shift_left_can_truncate_non_blank_characters():
 
 
 def test_shift_left_past_the_lines_length_yields_empty_not_an_error():
-    result = run(["ab", "x"], [(1, "(((")])
+    result = run(["ab", "x"], [(1, "(5")])
     assert_ok(result, ["", "x"])
 
 
-def test_shift_angle_bracket_left_is_an_alias_for_parenthesis():
+def test_shift_triple_character_is_unknown_command():
+    # There's no 3+ repeated-character form — only a bare char (default
+    # width), an explicit count (`)n`), or the doubled BLOCK form (`))`).
+    result = run(DOC, [(1, ")))")])
+    assert_error(result, line=1, substring="unknown line command")
+
+
+def test_shift_angle_bracket_is_not_a_column_shift_alias():
+    # Real ISPF's `<`/`>` are a different command entirely (Data Shift,
+    # not Column Shift) that this project doesn't implement — see the
+    # module docstring. They're plain unknown commands here, not aliases
+    # of `(`/`)`.
     result = run(["abc"], [(1, "<")])
-    assert_ok(result, ["c"])
-
-
-def test_shift_angle_bracket_right_double():
-    result = run(["abc"], [(1, ">>")])
-    assert_ok(result, ["    abc"])
+    assert_error(result, line=1, substring="unknown line command")
 
 
 def test_shift_amount_zero_rejected():
@@ -382,6 +383,51 @@ def test_shift_amount_zero_rejected():
 def test_shift_does_not_move_or_drop_a_label_on_the_line():
     result = run(["abc", "def"], [(1, ")")], labels={"A": 1})
     assert_ok(result, ["  abc", "def"], expected_labels={"A": 1})
+
+
+def test_shift_block_right_default_width():
+    result = run(["a", "b", "c"], [(1, "))"), (3, "))")])
+    assert_ok(result, ["  a", "  b", "  c"])
+
+
+def test_shift_block_left_default_width():
+    result = run(["  a", "  b", "  c"], [(1, "(("), (3, "((")])
+    assert_ok(result, ["a", "b", "c"])
+
+
+def test_shift_block_right_explicit_count_on_opening_marker():
+    result = run(["a", "b"], [(1, "))3"), (2, "))")])
+    assert_ok(result, ["   a", "   b"])
+
+
+def test_shift_block_right_explicit_count_on_closing_marker():
+    result = run(["a", "b"], [(1, "))"), (2, "))3")])
+    assert_ok(result, ["   a", "   b"])
+
+
+def test_shift_block_right_closing_count_wins_over_opening():
+    result = run(["a", "b"], [(1, "))5"), (2, "))3")])
+    assert_ok(result, ["   a", "   b"])
+
+
+def test_shift_block_unmatched_is_an_error():
+    result = run(DOC, [(1, "))")])
+    assert_error(result, line=1, substring="unmatched '))'")
+
+
+def test_shift_block_left_unmatched_is_an_error():
+    result = run(DOC, [(1, "((")])
+    assert_error(result, line=1, substring="unmatched '(('")
+
+
+def test_shift_block_does_not_move_or_drop_labels():
+    result = run(["a", "b", "c"], [(1, "))"), (3, "))")], labels={"X": 2})
+    assert_ok(result, ["  a", "  b", "  c"], expected_labels={"X": 2})
+
+
+def test_shift_block_overlapping_another_line_command_is_an_error():
+    result = run(["a", "b", "c"], [(1, "))"), (2, "d"), (3, "))")])
+    assert_error(result, line=2, substring="has its own line command")
 
 
 def test_shift_malformed_code_is_unknown_command():

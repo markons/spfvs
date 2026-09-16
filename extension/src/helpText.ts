@@ -32,12 +32,19 @@ a                 destination marker: after this line
 b                 destination marker: before this line
 x[n]              EXCLUDE: hide n lines starting here from view (default 1)
 xx ... xx         EXCLUDE the block between two xx markers
-)  ))  ...        SHIFT this line's text right, 2 columns per repeated char
->  >>  ...        (alias of the above)
-)n  >n            SHIFT right by exactly n columns
-(  ((  ...        SHIFT this line's text left, 2 columns per repeated char
-<  <<  ...        (alias of the above)
-(n  <n            SHIFT left by exactly n columns
+)                 Column Shift Right this line by the default width (2)
+)n                Column Shift Right this line by exactly n columns
+)) ... ))         Column Shift Right the whole block between two ))
+                  markers (count on either marker overrides the default;
+                  closing wins if both specify one)
+(                 Column Shift Left this line by the default width (2)
+(n                Column Shift Left this line by exactly n columns
+(( ... ((         Column Shift Left the whole block (same rule as ))...))
+                  above). NOTE: > and < are NOT aliases of )/( -- real
+                  ISPF's >/< is a different command (Data Shift) this
+                  project doesn't implement (needs BOUNDS + language-
+                  specific label/comment fields); they're just unknown
+                  line commands here.
 .name             LABEL: assign a name (1-8 chars, starts with a letter)
 .                 clear whatever label is on this line
 uc                UPPERCASE this line
@@ -89,6 +96,41 @@ save                                save the file
 cancel / can                        discard all unsaved changes and close
 end / pf3                           save and close
 help / h                            show this reference
+
+EDIT MACROS -- any word that isn't a built-in command above
+--------------------------------------------------------------------
+Typing a word that doesn't match any built-in command looks for
+.spfvs/macros/<word>.py in the current workspace and runs it, passing
+any following words as arguments -- e.g. "todocomment" runs
+.spfvs/macros/todocomment.py. Only works in a TRUSTED workspace.
+A macro file defines a plain Python function:
+
+    def run(ctx, args):
+        ...
+
+ctx (an EditContext) exposes: line_count, first_line, last_line,
+cursor_line (read/write, clamped back into range after a delete shrinks
+past it), get_line(n)/set_line(n, text) (change_line is an alias for
+set_line), insert_after(n, text)/insert_before(n, text) (insert a new
+line; insert_after(ctx.last_line, ...) appends, insert_before(ctx.
+first_line, ...) prepends), delete_line(n)/delete_lines(start, end),
+find_all(text) (a plain substring search, returns a snapshot list of
+{line, text} matches), resolve_label(name) (the line number for .name /
+.ZFIRST / .ZLAST / .ZCSR, or None), set_label(name, line) / clear_label
+(name) (create/move/remove a label -- same 1-8-char, letter-first,
+Z-reserved rules as a gutter .name commit; existing labels are remapped
+correctly through insert/delete), and message(text) -- shown to the
+user when the macro finishes, alongside anything the macro printed with
+a plain print(). A short result shows in the COMMAND ===> status area;
+a long or multi-line one instead goes to a "SPFVS Macros" output
+channel (that status area is a single truncating line), with a short
+summary left in the status bar pointing you at it. There's no dedicated
+copy/move -- compose get_line + insert_after/insert_before +
+delete_line instead (see .spfvs/macros/duplicateline.py). See also
+.spfvs/macros/todocomment.py, .spfvs/macros/showlabel.py, and
+.spfvs/macros/setlabel.py in this repo for full worked examples. Phase 1
+only: macros still can't prompt interactively or reach exclude/the
+CUT-PASTE clipboard.
 
 GUTTER NAVIGATION
 --------------------------------------------------------------------

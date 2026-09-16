@@ -41,18 +41,33 @@ Supported commands (case-insensitive):
          (unchanged) — PASTE (a *primary* command, not this one) is the
          only way to insert the clipboard, and it doesn't use a/b at all.
   b      destination marker: "before this line" — same as `a` above.
-  )      SHIFT the line's text right by the default shift width (2 columns)
-  ))     SHIFT right by 2x the default width per extra repeated `)`
-         (`)))` = 3x, etc.) — or use `>`, `>>`, `>>>`, ... instead, an
-         alternate spelling ISPF treats as identical to `)`/`))`/`)))`
-  )n     SHIFT right by exactly n columns (an explicit override, not a
-         multiple of the default width) — `>n` is again the same thing
-  (      SHIFT the line's text left by the default shift width (2 columns);
-         `((`, `(((`, ... and `<`, `<<`, `<<<`, ... all work the same way
-         as their `)`/`>` counterparts above, including `(n`/`<n` for an
-         explicit column count. Shifting left is a blind truncation, same
-         as real ISPF: it drops the leftmost n characters whether or not
-         they're blank, so shifting left too far can discard real text.
+  )      Column Shift Right: shift THIS line's text right by the default
+         shift width (2 columns)
+  )n     Column Shift Right by exactly n columns instead of the default
+  ))..)) Column Shift Right the whole BLOCK between two `))` markers
+         (inclusive) — a real ISPF block form, paired the same way as
+         `dd`..`dd`/`cc`..`cc` (unmatched is an error); an explicit count
+         on EITHER marker (`))3`) overrides the default width for the
+         whole block — if both markers carry one, the closing marker's
+         count wins (same tie-break as `rr`..`rr`'s count)
+  (      Column Shift Left: shift THIS line's text left by the default
+         shift width (2 columns). Shifting left is a blind truncation,
+         same as real ISPF: it drops the leftmost n characters whether or
+         not they're blank, so shifting left too far can discard real
+         text.
+  (n     Column Shift Left by exactly n columns instead of the default
+  ((..(( Column Shift Left the whole BLOCK between two `((` markers —
+         same pairing/count rules as `))`..`))` above
+  Real ISPF also has a SEPARATE `>`/`<` "Data Shift" line command (moves
+  a program statement's body without its label/comment fields, and stops
+  with an `==ERR>` flag instead of truncating past a BOUNDS setting) —
+  this project does NOT implement it: it needs a BOUNDS concept (already
+  deferred, see the ISPF-parity cluster mentioned in CLAUDE.md) and a
+  language-specific definition of "label"/"comment" fields this project
+  has no generic way to provide. `>`/`<` are therefore plain unknown line
+  commands here, not aliases of `)`/`(` — an earlier version of this
+  project mistakenly treated them as aliases; that was never real ISPF
+  behavior and has been removed.
   x[n]   EXCLUDE: hide n lines starting here from view (default n=1)
   xx..xx EXCLUDE the block between two `xx` lines (inclusive) from view
          Like a label, EXCLUDE doesn't edit the document — it's
@@ -120,14 +135,17 @@ from .models import Command, CommandError, LinePlan, ProcessResult
 
 _SINGLE_RE = re.compile(r"^([drcmix])(\d*)$")
 _LABEL_RE = re.compile(r"^\.([A-Za-z][A-Za-z0-9]{0,7})$")
-# Group 2 is EITHER more copies of the same character as group 1 (shift by
-# a multiple of the default width) OR digits (shift by that exact column
-# count) OR empty (a single bare `)`/`(`/`>`/`<`) — never a mix of both,
-# so something like "()" or ")3)" falls through to the generic
-# "unknown line command" error instead of matching here.
-_SHIFT_RE = re.compile(r"^([()<>])(\1*|\d*)$")
+# Group 1 is the shift character (`)`/`(`); group 2 is an optional SECOND
+# copy of it (present => this is the `))`/`((` BLOCK form, a real ISPF
+# construct paired like dd/cc/mm/xx below — see the module docstring);
+# group 3 is optional digits (an explicit column count, valid on either
+# the single-line or block form). No third+ repetition is valid — ")))"
+# falls through to the generic "unknown line command" error, same as any
+# other malformed code.
+_SHIFT_RE = re.compile(r"^([()])(\1?)(\d*)$")
 _SHIFT_DEFAULT_WIDTH = 2
 _BLOCK_REPEAT_RE = re.compile(r"^rr(\d*)$")
+_SHIFT_BLOCK_CODES = ("))", "((")
 _BLOCK_CODES = ("dd", "cc", "mm", "xx")
 _DEST_CODES = ("a", "b")
 _CASE_CODES = ("uc", "lc")
@@ -257,19 +275,26 @@ def process(
             continue
         shift_match = _SHIFT_RE.match(code)
         if shift_match:
-            shift_char, rest = shift_match.group(1), shift_match.group(2)
-            direction = -1 if shift_char in "(<" else 1
-            if rest and rest[0].isdigit():
-                amount = int(rest)
+            shift_char, doubled, digits = shift_match.group(1), shift_match.group(2), shift_match.group(3)
+            direction = -1 if shift_char == "(" else 1
+            if digits:
+                amount = int(digits)
                 if amount < 1:
                     errors.append(CommandError(cmd.line, f"shift amount must be at least 1 in '{cmd.code}'"))
                     continue
             else:
-                # rest is empty or more copies of shift_char: 1 + len(rest)
-                # total occurrences of the character, each worth one
-                # default-width shift.
-                amount = (1 + len(rest)) * _SHIFT_DEFAULT_WIDTH
-            parsed.append((cmd.line, "shift", direction * amount))
+                # 0 is a sentinel meaning "no explicit count given" — for
+                # the block form this is resolved against the OTHER
+                # marker's count (or the default width) once both markers
+                # are known, below; for a single-line shift it's resolved
+                # to the default width immediately, right here.
+                amount = 0
+            if doubled:
+                parsed.append((cmd.line, shift_char * 2, amount))
+            else:
+                if amount == 0:
+                    amount = _SHIFT_DEFAULT_WIDTH
+                parsed.append((cmd.line, "shift", direction * amount))
             continue
         if code_lower in _CASE_CODES:
             case_lines[code_lower].append(cmd.line)
@@ -319,7 +344,14 @@ def process(
     #   ("repeat_block", start, end, count, defining_lines)
     #   ("insert", line, count, defining_lines)
     #   ("copy"/"move", start, end, dest, before, defining_lines)
-    pending_block: dict[str, int | None] = {"dd": None, "cc": None, "mm": None, "xx": None, "rr": None}
+    pending_block: dict[str, int | None] = {
+        "dd": None, "cc": None, "mm": None, "xx": None, "rr": None, "))": None, "((": None,
+    }
+    # Mirrors `pending_rr_count` below, but per shift direction (a `))`
+    # block and a `((` block could both be open in the same batch) — 0 is
+    # "no explicit count on this marker" (see the `_SHIFT_RE` handling
+    # above), never confused with a real count since one must be >= 1.
+    pending_shift_count: dict[str, int] = {"))": 0, "((": 0}
     # Copy/move sources and their a/b destination markers don't have to
     # appear in a fixed relative order (moving a line UP means the
     # destination marker's line number is smaller than the source's), so
@@ -328,11 +360,13 @@ def process(
     src_dest_events: list[tuple[str, dict]] = []
 
     for line, category, count in parsed:
-        if category in _BLOCK_CODES or category == "rr":
+        if category in _BLOCK_CODES or category == "rr" or category in _SHIFT_BLOCK_CODES:
             if pending_block[category] is None:
                 pending_block[category] = line
                 if category == "rr":
                     pending_rr_count = count
+                elif category in _SHIFT_BLOCK_CODES:
+                    pending_shift_count[category] = count
                 continue
             start, end = pending_block[category], line
             pending_block[category] = None
@@ -347,6 +381,14 @@ def process(
                 # specify one (a rare, unrecommended thing to do anyway).
                 final_count = count if count > 1 else (pending_rr_count if pending_rr_count > 1 else 1)
                 operations.append(("repeat_block", start, end, final_count, {start, end}))
+            elif category in _SHIFT_BLOCK_CODES:
+                # Same tie-break as rr above: an explicit count on either
+                # marker wins (closing checked first), falling back to the
+                # default shift width if neither specified one.
+                opening_count = pending_shift_count[category]
+                final_amount = count if count > 0 else (opening_count if opening_count > 0 else _SHIFT_DEFAULT_WIDTH)
+                direction = -1 if category == "((" else 1
+                operations.append(("shift_block", start, end, direction * final_amount, {start, end}))
             else:
                 kind = "copy" if category == "cc" else "move"
                 src_dest_events.append(("source", {"kind": kind, "start": start, "end": end,
@@ -449,18 +491,20 @@ def process(
     if errors:
         return ProcessResult(errors=errors, plan=None)
 
-    # Range/overlap validation. SHIFT is deliberately exempt: it only ever
-    # touches the single line it's typed on (no implicit range the way
-    # delete/repeat/insert/exclude's counts do), and that line's own
-    # in-range/not-duplicated status is already checked above via
-    # `seen_lines` — its second tuple field is a signed column delta, not
-    # an end-line, so it must never reach the generic start/end unpacking
-    # below.
+    # Range/overlap validation. Single-line SHIFT is deliberately exempt:
+    # it only ever touches the single line it's typed on (no implicit
+    # range the way delete/repeat/insert/exclude's counts do), and that
+    # line's own in-range/not-duplicated status is already checked above
+    # via `seen_lines` — its second tuple field is a signed column delta,
+    # not an end-line, so it must never reach the generic start/end
+    # unpacking below. `shift_block` (the `))`/`((` block form) DOES have
+    # a real start/end range spanning multiple lines, so it's checked
+    # like any other block op, not exempted the way plain `shift` is.
     for op in operations:
         kind = op[0]
         if kind == "shift":
             continue
-        if kind in ("case", "repeat_block", "paste"):
+        if kind in ("case", "repeat_block", "paste", "shift_block"):
             _, start, end, _extra, defining = op
         elif kind in ("delete", "repeat", "insert", "exclude", "cut", "clip_copy"):
             _, start, end, defining = op
@@ -561,6 +605,15 @@ def process(
             # ISPF, shifting left past the line's content discards it
             # rather than stopping at the first non-blank character.
             entries[(line, 0)] = (" " * delta + text) if delta > 0 else text[-delta:]
+        elif kind == "shift_block":
+            _, start, end, delta, _defining = op
+            # Same per-line formula as plain "shift" above, just applied
+            # to every line in the block's range independently — each
+            # line's identity/position is unchanged (only its text), so
+            # this needs no line_new_key remapping the way copy/move do.
+            for ln in range(start, end + 1):
+                text = lines[ln - 1]
+                entries[(ln, 0)] = (" " * delta + text) if delta > 0 else text[-delta:]
         else:  # copy / move
             _, start, end, dest, before, _defining = op
             block = [lines[i - 1] for i in range(start, end + 1)]

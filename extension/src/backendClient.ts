@@ -40,6 +40,21 @@ export interface BackendResponse {
   pendingMark: PendingMark | null;
 }
 
+// A macro's result — separate response shape from BackendResponse, sent
+// for `type: "runMacro"` requests (see macros.py/server.py's module
+// docstrings). Deliberately its own request/response pair, not folded
+// into the existing prefix-command shape, so a macro bug can never touch
+// that well-tested path.
+export interface MacroResponse {
+  id: number;
+  ok: boolean;
+  lines: string[] | null;
+  cursorLine: number | null;
+  labels: Record<string, number> | null;
+  message: string;
+  error: string | null;
+}
+
 /**
  * Talks to one persistent `python -m ispf_backend` process over newline-
  * delimited JSON on stdin/stdout. One client is shared by every open
@@ -48,7 +63,12 @@ export interface BackendResponse {
 export class BackendClient {
   private process: cp.ChildProcessWithoutNullStreams | undefined;
   private nextId = 1;
-  private readonly pending = new Map<number, { resolve: (r: BackendResponse) => void; reject: (e: Error) => void }>();
+  // Shared between both response shapes (BackendResponse and
+  // MacroResponse both carry an "id") — each public method below
+  // constructs its own correctly-typed Promise, so the untyped `resolve`
+  // here is safe: it's cast back to the right shape at the one call site
+  // that created it.
+  private readonly pending = new Map<number, { resolve: (r: any) => void; reject: (e: Error) => void }>();
   private buffer = "";
 
   constructor(private readonly pythonPath: string) {}
@@ -87,7 +107,7 @@ export class BackendClient {
       const line = this.buffer.slice(0, newlineIndex);
       this.buffer = this.buffer.slice(newlineIndex + 1);
       if (!line.trim()) continue;
-      let response: BackendResponse;
+      let response: { id: number };
       try {
         response = JSON.parse(line);
       } catch {
@@ -115,6 +135,36 @@ export class BackendClient {
     const id = this.nextId++;
     const request =
       JSON.stringify({ id, lines, commands, labels, excludedLines, pendingMark, executeCut, executePaste }) + "\n";
+    return new Promise((resolve, reject) => {
+      this.pending.set(id, { resolve, reject });
+      proc.stdin.write(request, (err) => {
+        if (err) {
+          this.pending.delete(id);
+          reject(err);
+        }
+      });
+    });
+  }
+
+  /** Runs a macro file (an absolute filesystem path the caller already
+   * resolved via macros.ts's lookup) against a snapshot of the document.
+   * Sent as `type: "runMacro"` — a separate request shape from the
+   * default (untyped) prefix-command one, so server.py can dispatch
+   * between them without touching the existing, well-tested
+   * `process()` path at all (see macros.py's module docstring).
+   * `labels` is read-only here — the macro can `resolve_label()` an
+   * existing one, but nothing comes back to update the caller's own
+   * copy, since Phase 1 macros can't create/clear one. */
+  runMacro(
+    macroPath: string,
+    lines: string[],
+    cursorLine: number,
+    args: string[],
+    labels: Record<string, number>
+  ): Promise<MacroResponse> {
+    const proc = this.ensureStarted();
+    const id = this.nextId++;
+    const request = JSON.stringify({ id, type: "runMacro", macroPath, lines, cursorLine, args, labels }) + "\n";
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject });
       proc.stdin.write(request, (err) => {

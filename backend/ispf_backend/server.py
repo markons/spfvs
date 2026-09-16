@@ -1,18 +1,21 @@
 """Newline-delimited JSON stdio server.
 
-Not JSON-RPC — this protocol only ever has one request shape (process a
-batch of prefix commands against a document), so a small hand-rolled
-framing is simpler than pulling in a JSON-RPC dependency. One JSON object
-per line in both directions.
+Two request shapes, distinguished by an optional `"type"` field — the
+original prefix-command shape (no `type`, or any value other than
+`"runMacro"`) and the macro shape (`"type": "runMacro"`, see
+`_handle_macro()`/macros.py). One JSON object per line in both
+directions.
 
-Request:  {"id": <any>, "lines": [str, ...], "commands": [{"line": int, "code": str}, ...],
-           "labels": {name: line, ...}, "excludedLines": [int, ...],
-           "pendingMark": {"kind": "copy"|"move", "start": int, "end": int} | null,
-           "executeCut": bool, "executePaste": {"line": int, "before": bool} | null}
-Response: {"id": <same>, "errors": [{"line": int, "message": str}, ...],
-           "plan": {"lines": [str, ...], "consumedLines": [int, ...]} | null,
-           "labels": {name: line, ...} | null, "excludedLines": [int, ...] | null,
-           "pendingMark": {"kind": "copy"|"move", "start": int, "end": int} | null}
+Prefix-command request:
+  {"id": <any>, "lines": [str, ...], "commands": [{"line": int, "code": str}, ...],
+   "labels": {name: line, ...}, "excludedLines": [int, ...],
+   "pendingMark": {"kind": "copy"|"move", "start": int, "end": int} | null,
+   "executeCut": bool, "executePaste": {"line": int, "before": bool} | null}
+Prefix-command response:
+  {"id": <same>, "errors": [{"line": int, "message": str}, ...],
+   "plan": {"lines": [str, ...], "consumedLines": [int, ...]} | null,
+   "labels": {name: line, ...} | null, "excludedLines": [int, ...] | null,
+   "pendingMark": {"kind": "copy"|"move", "start": int, "end": int} | null}
 
 `labels`/`excludedLines`/`pendingMark` are caller-owned state (see
 prefix_commands.py's module docstring for LABEL/EXCLUDE/CUT-PASTE
@@ -28,17 +31,66 @@ request with neither set (and no `commands`) is just "give me the
 document back unchanged, but still report current labels/excludedLines/
 pendingMark", which the extension host doesn't currently have a reason to
 send but which falls out naturally from every field being optional.
+
+Macro request:
+  {"id": <any>, "type": "runMacro", "lines": [str, ...], "cursorLine": int,
+   "macroPath": str, "args": [str, ...], "labels": {name: line, ...}}
+Macro response:
+  {"id": <same>, "ok": bool, "lines": [str, ...] | null,
+   "cursorLine": int | null, "labels": {name: line, ...} | null,
+   "message": str, "error": str | null}
+
+`macroPath` is an absolute filesystem path the extension host already
+resolved (see extension/src/macros.ts) — the backend just reads and
+execs it (see macros.py's `run_macro()`); no macro source is ever sent
+inline over the wire. `labels` is optional on the request (the macro's
+current name->line map, for `EditContext.resolve_label()`/`set_label()`/
+`clear_label()`) and, unlike Phase 1's original read-only version, IS
+echoed back updated on the response — same "caller persists whatever
+comes back" contract a prefix-command response's `labels` already has.
+`lines`/`cursorLine`/`labels` on a *response* are only present when `ok`
+is true; a failed macro (bad file, exception, etc.) reports `error`
+instead and leaves the caller's document untouched, same "reject the
+whole thing, change nothing" spirit as a rejected prefix-command batch.
 """
 from __future__ import annotations
 
 import json
 import sys
 
+from .macros import run_macro
 from .models import Command
 from .prefix_commands import process
 
 
+def _handle_macro(request: dict) -> dict:
+    req_id = request.get("id")
+    try:
+        lines = request["lines"]
+        cursor_line = int(request.get("cursorLine", 1))
+        macro_path = request["macroPath"]
+        args = request.get("args") or []
+        labels = request.get("labels") or {}
+    except (KeyError, TypeError, ValueError) as e:
+        return {
+            "id": req_id, "ok": False, "lines": None, "cursorLine": None,
+            "message": "", "error": f"malformed macro request: {e}",
+        }
+    result = run_macro(macro_path, lines, cursor_line, args, labels)
+    return {
+        "id": req_id,
+        "ok": result.ok,
+        "lines": result.lines,
+        "cursorLine": result.cursor_line,
+        "labels": result.labels,
+        "message": result.message,
+        "error": result.error,
+    }
+
+
 def _handle(request: dict) -> dict:
+    if request.get("type") == "runMacro":
+        return _handle_macro(request)
     req_id = request.get("id")
     try:
         lines = request["lines"]

@@ -1,5 +1,122 @@
 # CLAUDE.md — project notes for spfvs
 
+## Status as of 2026-09-16: Edit macros can now SET/CLEAR labels (`ctx.set_label`/`ctx.clear_label`)
+
+Owner audited the macro feature list against a checklist ("Find/Find
+Next, Change/Replace, Insert, Delete, Line ranges, Copy/Move, Macro
+arguments, Return codes, Labels, Column operations") across two rounds;
+after insert/delete-line support shipped, the only two genuine gaps left
+were Labels (still read-only) and Column operations (nothing built).
+Owner: "can you realize set-label?" — this entry is that.
+
+**Backend (`backend/ispf_backend/macros.py`)**: `EditContext` gained
+`set_label(name, line)` and `clear_label(name)`, deliberately mirroring
+`prefix_commands.py`'s own LABEL validation EXACTLY rather than
+inventing divergent rules — a fresh `_LABEL_NAME_RE = re.compile(r"^[A-
+Za-z][A-Za-z0-9]{0,7}$")` restated here (not imported — that name is
+`prefix_commands.py`'s own private implementation detail, and this
+module is deliberately kept independent of it, per the module
+docstring; keep the two regexes in sync by hand if either ever
+changes), same fold-to-uppercase, same "names starting with Z are
+reserved" rejection, same "one label per line — assigning a new name to
+an already-labeled line replaces the old one" behavior, same "a label
+can be moved to a different line via plain dict overwrite" semantics.
+`clear_label` is lenient (a no-op, not an error, if the name isn't set)
+— matches how a gutter `.` clear behaves whether or not anything was
+actually there. New `result_labels()` returns the final map, read by
+`run_macro()` and returned as `MacroResult.labels`.
+
+**The other half of this piece, easy to miss**: `insert_after`/
+`insert_before`/`delete_line`/`delete_lines` (added the previous round)
+did NOT remap `self._labels` at all — harmless while labels were
+read-only, but a real latent bug the instant they became settable
+(existing labels would silently go stale the moment a macro also
+inserted/deleted a line). Fixed with two new helpers,
+`_remap_labels_for_insert(at_line)` (every label at or after the new
+line's position shifts down by one) and `_remap_labels_for_delete(start,
+end)` (a label inside the deleted range is dropped; one after it shifts
+up by the removed count) — wired into all four insert/delete methods.
+This is the exact same "caller-owned, backend-remapped state" pattern
+`prefix_commands.py`'s own `process()` uses for its `line_new_key`/
+`key_to_new_line` machinery, just reimplemented at `EditContext`'s
+smaller scale (no batch of mixed operation kinds to reconcile, just one
+insert/delete at a time).
+
+**Extension host (`extension/src/ispfEditorProvider.ts`) — the
+necessary architectural change**: `handleMacroAction` previously applied
+a macro's edit via the SAME `appliedByUs`/`applyEditTrackingOurVersion`
+path a plain Monaco keystroke uses — deliberately chosen back when
+Phase 1 macros were snapshot-only and labels were read-only, since there
+was nothing to remap. That path's `onDidChangeTextDocument` branch
+UNCONDITIONALLY drops labels/excludedLines/pendingMark after ANY edit on
+it (same as a real typed keystroke, where that's the only safe
+assumption) — which would now silently discard a macro's own
+`set_label()`/`clear_label()` result the instant it was applied. Fixed
+by switching `handleMacroAction` onto the SAME `pendingBatchEditVersions`
+pattern `handlePrefixCommands`/`handleClipboardAction` already use: an
+`onStateResolved(labels, pendingMark, expectedDocVersion)` callback
+updates the caller's closure state BEFORE the edit is applied (or before
+returning, if no edit is needed), rather than after. `pendingMark` is
+defensively cleared whenever an edit IS applied (a macro's own
+restructuring isn't remapped through it) but left untouched when no
+edit occurs (nothing shifted, so it's still valid).
+
+**The "no edit, but labels still changed" case, worth understanding**: a
+macro that ONLY calls `set_label`/`clear_label` (no `set_line`/insert/
+delete at all) produces `newText === document.getText()` — same
+non-destructive shape `handleClipboardAction`'s copy-mark case already
+skips the edit for. But unlike that CUT/PASTE case (which never actually
+changes labels, so there's nothing new to display), a macro's labels
+really did change here, and skipping the edit means the usual
+`setContent` message (which normally carries `labels` along) never
+fires — so `handleMacroAction` now pushes an explicit `{type:
+"setLabels", labels: newLabels}` message directly in that branch, rather
+than assuming the webview will find out some other way.
+
+**Shipped example (`.spfvs/macros/setlabel.py`, new)**: `setlabel <name>`
+assigns to the cursor's line, `setlabel <name> <line>` to an explicit
+line, `setlabel <name> clear` removes it — added as a NEW file rather
+than editing `.spfvs/macros/showlabel.py` (which the owner had already
+hand-edited earlier this session to append cursor-line text to its
+message; left untouched, not reverted).
+
+Backend: 22 new pytest cases in `test_macros.py` — `set_label`
+(valid/format-invalid/reserved-Z/out-of-range/replaces-existing-label-
+on-same-line/moves-existing-name-to-new-line), `clear_label` (existing/
+leading-dot-and-lowercase/no-op-when-absent), label remapping through
+each of `insert_after`/`insert_before`/`delete_line`/`delete_lines`
+(shifts correctly; dropped when its exact line is deleted; unaffected
+when unrelated to the change), two `run_macro()` end-to-end tests
+(`result.labels` reflects set_label+clear_label; reflects remapping
+through a delete), and three shipped-example integration tests for
+`setlabel.py`. **172 total backend tests, all passing** (up from 151 at
+the start of this round). `npm run typecheck` and `npm run compile`
+both pass.
+
+Updated `README.md` (EditContext table: `set_label`/`clear_label` rows
+added, `resolve_label`'s row no longer says read-only; a new "Example:
+setting and clearing a label" section; Phase 1 limitations bullet
+rewritten to reflect labels now being read/write and remapped), 
+`extension/src/helpText.ts` (macro section), and `server.py`'s module
+docstring + `_handle_macro`'s response dict (`labels` now echoed back on
+a macro response, no longer a request-only, read-only field) and
+`backendClient.ts`'s `MacroResponse` interface (`labels` field added).
+
+Packaged and installed as **v0.0.29**. **Not yet tested by the owner** —
+manual test focus: set a label with a macro (`setlabel foo`) and confirm
+it shows up in the gutter immediately with NO document edit/dirty-flag
+change; `setlabel foo 5` to an explicit line; `setlabel foo clear`
+removes it; set a label with the GUTTER (`.bar`), then run a macro that
+inserts/deletes lines around it (e.g. `duplicateline`) and confirm the
+gutter label follows correctly, the same way it would after a gutter
+`i`/`d` prefix command; a macro that both edits text AND sets a label in
+the same run (not yet shipped as an example — try composing one) to
+confirm both land correctly in one go; reserved `Z`-prefixed and
+malformed names are rejected with a clear macro error, not silently
+ignored.
+
+
+
 A VS Code custom editor recreating the ISPF full-screen editing experience:
 Monaco embedded in a webview, with a real editable prefix-command gutter
 (not just decorative line numbers) and an ISPF-style primary command line
@@ -15,7 +132,485 @@ status entry for what was and wasn't touched. Folder is
 same day; don't confuse either with the unrelated repo git finds by
 walking up to `C:\Users\maga1`).
 
-## Status as of 2026-09-14 (latest): HELP primary command
+## Status as of 2026-09-16 (latest): macro insert/delete-line support — unblocks Insert/Delete/Copy/Move
+
+Owner asked me to audit `EditContext` against a 10-item ISPF-macro
+feature checklist (Find/Find Next, Change/Replace, Insert, Delete, Line
+ranges, Copy/Move, Macro arguments, Return codes, Labels, Column
+operations). Verdict at the time: 2 fully done (arguments, return-
+codes-as-exceptions), 4 achievable via composition with no dedicated
+helper (find-next, change, line ranges, columns), 3 hard-blocked by one
+root cause (Insert/Delete/Copy-Move all need a line-count-changing
+primitive that didn't exist), labels half-built (read-only). Owner's
+instruction: build the line-count primitive, since it unblocks three
+items at once.
+
+**Backend (`macros.py`)**: `EditContext` gained four methods —
+`insert_after(line, text)` / `insert_before(line, text)` (either can
+insert at the very ends via `ctx.last_line`/`ctx.first_line`) and
+`delete_line(line)` / `delete_lines(start, end)` (the range form exists
+specifically so a macro doesn't have to loop `delete_line()` calls and
+fight index-shifting after each one). All four range-check their
+arguments the same way `get_line`/`set_line` already do (a `MacroError`
+on an invalid line number, reported as an ordinary macro failure).
+
+**Deliberately NOT added**: dedicated `copy`/`move` methods. Copy is
+`get_line` + `insert_after`/`insert_before`; Move is that plus
+`delete_line` on the original — both trivial one-or-two-line
+compositions (see the new shipped example below), so a third pair of
+methods would be pure duplication for the sake of a label. If this
+turns out to feel clunky in practice, revisit.
+
+**New invariant, handled explicitly**: `cursor_line` can become invalid
+after a `delete_line`/`delete_lines` shrinks the document past it (e.g.
+cursor was on line 10, macro deletes lines 8-12). New private
+`_clamp_cursor()` (called at the end of every insert/delete) clamps it
+back to `line_count` (or `1` if the document became empty) — mirrors
+the SAME clamp already done once, in the constructor, for a stale
+caller-supplied initial value. Deliberately just a clamp, not an
+attempt to track "where did the cursor's original line go" — `insert_*`
+docstrings say so explicitly, so a macro that cares about relative
+position sets `ctx.cursor_line` itself afterward rather than assuming.
+
+**Architectural question resolved without any code change**: does
+`ispfEditorProvider.ts`'s `handleMacroAction` (which applies a macro's
+result via the same `appliedByUs`-tracked path plain Monaco keystrokes
+use, NOT the `pendingBatchEditVersions` remapping path prefix-command
+batches use) still work correctly now that macros can change line
+count? **Yes — re-read the `onDidChangeTextDocument` listener and
+confirmed the `appliedByUs` branch ALREADY drops labels/excludedLines/
+pendingMark UNCONDITIONALLY for every edit on that path**, regardless
+of whether the line count changed — it was never contingent on "same
+line count = safe," it's the same defensive "not run through remapping,
+so drop rather than risk staleness" behavior a plain typed keystroke
+edit already gets. So the ONLY change needed was fixing a stale doc
+comment on `handleMacroAction` that had claimed (accurately, at the
+time it was written) that macros "can never change the document's LINE
+COUNT" — now corrected to explain why the architecture holds regardless.
+**Worth remembering if this area is touched again**: don't assume a
+"drop caller-owned state" branch needs new handling just because a
+precondition it was written under has changed — check whether the drop
+was already unconditional first.
+
+`find_all()`'s docstring gained a stronger version of its existing
+snapshot-staleness caution: a match's `.line` can now be wrong not just
+in CONTENT after a same-line edit, but in POSITION entirely after any
+insert/delete elsewhere in the document — call it again after
+restructuring rather than reusing an old result.
+
+**New shipped example, `.spfvs/macros/duplicateline.py`**: demonstrates
+exactly the Copy/Move composition — `duplicateline` (duplicate the
+cursor's line after itself), `duplicateline before` (before instead),
+`duplicateline move` (relocate it to the end of the file instead of
+copying). Joins `todocomment.py`/`showlabel.py` as the third shipped,
+pytest-verified example.
+
+Backend: 18 new pytest cases in `test_macros.py` — `insert_after`/
+`insert_before` at the ends and in the middle, out-of-range errors for
+both insert and delete, `delete_line`/`delete_lines` (including
+end-before-start rejection), cursor clamping when a delete shrinks past
+it vs. left alone when it doesn't, insert leaving an in-range cursor
+undisturbed, copy-via-composition and move-via-composition as direct
+unit tests of the pattern, one full `run_macro()` end-to-end test
+combining insert+delete+message, and three integration tests loading
+and running the actual shipped `duplicateline.py` (default-after,
+before, move). **151 total backend tests, all passing** (133 previous +
+18 new).
+
+Updated README's `EditContext` table (two new rows), a new "Example:
+insert, delete, and copy/move by composition" section, the Phase 1
+limitations bullet (removed "can't change line count" — replaced with
+the composition/no-dedicated-copy-move framing and the cursor-clamping
+note), and `helpText.ts`'s macro section to match. `npm run typecheck`
+and `npm run compile` both pass — no functional extension-host code
+changed, only a stale comment corrected (see above). **Not yet
+packaged/installed or tested by the owner** — verify: `duplicateline`/
+`duplicateline before`/`duplicateline move` all behave as described;
+write a throwaway macro that deletes several lines including the
+cursor's own line and confirm the editor's cursor ends up somewhere
+valid afterward rather than erroring; confirm labels/excludedLines
+still get dropped (not silently stale) after a line-count-changing
+macro, same as they already were for a same-count one.
+
+## Status as of 2026-09-16: macro output — long/multi-line results go to an Output Channel
+
+Owner asked (after writing `showlabel.py`'s multi-line report and
+asking where `ctx.message()` actually renders): where does a macro's
+message show up? Answer surfaced a real gap: the `COMMAND ===>` bar's
+status span (`.ispf-command-message` in `commandBar.css`) is
+`white-space: nowrap; overflow: hidden; text-overflow: ellipsis` — the
+SAME single-line, truncating style every other primary command's
+feedback already uses. A multi-line `ctx.message()` result (like
+`showlabel`'s 3-4 line report) would have its newlines collapsed into
+plain spaces by `nowrap` and then likely gotten cut off with `…`,
+losing everything past whatever fits the bar's width. This was flagged
+explicitly, then fixed on request — worth noting the Phase 1 planning
+conversation had actually already floated an Output Channel as the
+right answer for this ("route stdout capture to a dedicated 'SPFVS
+Macros' Output Channel... reserve the status-message line for the
+final one-line result"), but the SHIPPED Phase 1 implementation never
+built it — everything went through the single-line channel uniformly.
+This entry is that follow-through.
+
+**Fix (`ispfEditorProvider.ts`)**: new `private readonly
+macroOutputChannel: vscode.OutputChannel`, created once in the
+constructor (`vscode.window.createOutputChannel("SPFVS Macros")`,
+pushed to `context.subscriptions` for disposal) — one channel shared
+across every open SPFVS tab in this extension host, same "one instance
+per extension host" pattern `BackendClient` already uses. New private
+`reportMacroResult(webviewPanel, name, message, isError)` replaces
+every direct `primaryActionResult` `postMessage` call inside
+`handleMacroAction` (blocked-by-trust, unknown-command, macro-failed,
+and success — all four now go through it): if `message` fits (no `\n`,
+≤120 chars), it posts exactly as before, unchanged; otherwise it
+`appendLine`s `[<macro name>] <full message>` to the output channel,
+calls `.show(true)` (the `true` = `preserveFocus`, so the output panel
+becomes visible without yanking keyboard focus away from the editor),
+and posts a SHORT one-line summary instead (`<first line, clipped to 80
+chars>` + `— see "SPFVS Macros" output for full result`) so the status
+bar still shows something immediately useful rather than going silent.
+
+No backend change (this is purely how the extension host presents a
+`MacroResult` it already had — `macros.py`/`run_macro()` are untouched)
+and no new pytest cases for the same reason. `npm run typecheck` and
+`npm run compile` both pass. README's `EditContext` table and
+`helpText.ts`'s macro section both gained a short explanation of the
+short-vs-long routing rule and point at both shipped examples now
+(`todocomment.py` and `showlabel.py`). **Not yet packaged/installed or
+tested by the owner** — verify: a short macro result (e.g.
+`todocomment`'s "ISPF EDIT MACRO FINISHED\nLines in member: N" — this
+ALREADY has a `\n` in it, so it should now route to the output channel
+too, worth specifically re-checking since it predates this fix and
+wasn't rewritten) shows the summary+pointer in the status bar and the
+full text in "SPFVS Macros"; `showlabel`'s multi-line report does the
+same; a short single-line result (e.g. a plain `"macro completed"`)
+still shows directly in the status bar exactly as before, with no
+output channel involvement at all.
+
+## Status as of 2026-09-16: Edit macros — read-only label resolution (`ctx.resolve_label`)
+
+Owner asked (across a few short questions, working through the Phase 1
+`EditContext` surface interactively) whether a macro could detect a
+label SPFVS itself set via the gutter's `.name`. Answer at the time:
+no — Phase 1 (see the entry below) explicitly listed "direct access to
+labels" as deferred. Owner said to build it. Scoped down from "full
+label access" to just the READ side, per the offer made and accepted:
+a macro can now *resolve* an existing label to a line number, but still
+can't *create or clear* one — that stays deferred, since writing a
+label back would mean the extension host's `labels` closure state
+(currently only mutated by prefix-command batches and `RESET LAB`)
+gaining a THIRD writer, a bigger design question than this round's
+scope.
+
+**Backend (`macros.py`)**: `EditContext.__init__` gained an optional
+`labels: dict[str, int] | None` parameter, stored as `self._labels` — a
+read-only snapshot, same spirit as `self._lines`, no setter exposed.
+New method `resolve_label(name)`: strips a leading `.` if present,
+uppercases (matching how `prefix_commands.py` already stores label
+names), and either returns the reserved names computed fresh —
+`.ZFIRST`→`first_line`, `.ZLAST`→`last_line`, `.ZCSR`→**current**
+`cursor_line`, checked BEFORE the labels dict so a stale/malformed
+entry literally named `"ZFIRST"` could never shadow the reserved
+computation — or falls through to `self._labels.get(key)`, returning
+`None` (not raising) for an unset name, matching `find_all()`'s own
+"empty result, not an error" precedent for "nothing matched." `ZCSR`
+tracking the CURRENT cursor_line (not a snapshot at construction time)
+means a macro that moves the cursor via `ctx.cursor_line = n` and then
+calls `resolve_label(".ZCSR")` gets `n` back, not the original position
+— covered by its own test.
+
+`run_macro()` gained a matching optional `labels` parameter, threaded
+straight into `EditContext`; `server.py`'s `_handle_macro` reads an
+optional `"labels"` field off the request (defaults to `{}` if absent
+— an OLDER/other caller that doesn't send it still works, though there
+is currently only the one caller). The macro RESPONSE never echoes
+labels back — this is one-way, read-only, unlike how a prefix-command
+response returns an updated `labels` map.
+
+**Extension host**: `backendClient.ts`'s `runMacro()` gained a required
+`labels: Record<string, number>` parameter (the request always includes
+it now, even though the backend tolerates its absence);
+`ispfEditorProvider.ts`'s `handleMacroAction` gained a matching
+parameter, and its one call site (the `"primaryAction"`/`"macro"`
+branch in `onDidReceiveMessage`) passes the same closure-local `labels`
+variable prefix-command batches and `CUT`/`PASTE` already read from —
+no new state, just handing existing state to one more consumer.
+
+Backend: 9 new pytest cases in `test_macros.py` — `resolve_label` with
+a known name, lowercase/leading-dot normalization, an unknown name
+(`None`), no `labels` argument at all, all three reserved names, ZCSR
+tracking a cursor move, and confirmation a reserved name is never
+shadowable even by a maliciously-matching entry in the labels dict —
+plus two `run_macro()` integration tests (labels threaded all the way
+through end to end, and the "no labels arg" default-empty-dict case).
+**130 total backend tests, all passing** (121 previous + 9 new).
+`npm run typecheck` and `npm run compile` both pass.
+
+Updated the module docstring's "deferred" list (labels moved from
+"no access at all" to "read-only resolution only, still can't set"),
+README's `EditContext` table + Phase-1-limitations bullet, and
+`helpText.ts`'s macro section — all three now describe `resolve_label`
+consistently. Packaged and installed as **v0.0.26**. **Not yet tested
+by the owner** — try it by labeling a line with `.foo` in the gutter,
+committing that batch, then running a macro that calls
+`ctx.resolve_label(".foo")` and messages the result.
+
+**Follow-up same day**: owner asked for a sample macro demonstrating
+this — shipped as a THIRD example, `.spfvs/macros/showlabel.py`
+(joining `todocomment.py` and the README-only `striptrailing.py`
+snippet): `showlabel` alone reports `.ZFIRST`/`.ZLAST`/`.ZCSR`;
+`showlabel <name>` also resolves a real label and, if found, jumps
+`ctx.cursor_line` there (ISPF's `LOCATE .label` in one step) — reports
+`not set` rather than erroring if it doesn't exist. Added 3 more pytest
+cases mirroring `test_shipped_todocomment_example_macro`'s "load and
+run the ACTUAL shipped file" pattern (`_repo_example_macro_path` was
+generalized to take a filename rather than being hardcoded to
+`todocomment.py`): reserved-names-only, resolve-and-jump for a real
+label, and the not-set case (confirms `cursor_line` stays UNCHANGED
+when there's nothing to jump to). **133 total backend tests, all
+passing.** Pure data/test addition — no extension code changed, so no
+repackage needed for this follow-up; README gained a matching third
+"Example:" subsection.
+
+## Status as of 2026-09-15: Edit macros, Phase 1 — Python macros invoked from COMMAND ===>
+
+Owner asked (as an explicit design conversation first — "plan only,"
+then a REXX sample to validate the design against, then "implement the
+first version... prepare it ready for a backfall") for macro support
+similar to real ISPF's REXX edit macros. This entry is the actual
+implementation of that plan's Phase 1 — see the design conversation
+itself (session history, not reproduced here) for the fuller rationale
+and the REXX-to-Python idiom mapping worked out against the owner's own
+sample macro.
+
+**What "ready for a backfall" drove, concretely**: every piece of this
+is new, additive surface that reuses existing, already-trusted
+machinery wherever possible, rather than touching or risking the
+well-tested prefix-command engine:
+  - `server.py` dispatches on a NEW `"type": "runMacro"` field — any
+    request without it (i.e. every existing prefix-command request)
+    goes through the EXACT unchanged original code path. A macro bug
+    can't reach `process()`; a `process()` bug can't reach macros.
+  - Macro execution lives entirely in a new module, `macros.py` — zero
+    lines of `prefix_commands.py` changed.
+  - Applying a macro's result to the real document reuses the SAME
+    `appliedByUs`/`applyEditTrackingOurVersion` path plain Monaco
+    keystroke edits already use (see `applyMonacoEdit`) — deliberately
+    NOT the `pendingBatchEditVersions` remapping path prefix-command
+    batches use, because Phase 1 macros can never change the document's
+    LINE COUNT (no insert/delete-line API on `EditContext` yet), so
+    there's no restructuring to remap labels/excludedLines/pendingMark
+    THROUGH — reusing "ordinary edit" (which already resets that state,
+    same as direct typing does) is simpler and safer than building a
+    second remapping mechanism for a case that literally cannot arise
+    yet. If a later phase adds line insert/delete to `EditContext`,
+    this will need to move onto the `pendingBatchEditVersions` path.
+
+**Backend (`backend/ispf_backend/macros.py`, new)**: `EditContext`
+wraps an in-memory copy of the document + cursor line, exposing
+`line_count`/`first_line`/`last_line`, `cursor_line` (get/set, range-
+validated), `get_line`/`set_line` (`change_line` is a plain alias),
+`find_all(text)` (a snapshot substring search — see its own docstring
+for why snapshot-not-live was chosen, and the exact caveat about
+mutating a line then re-reading stale match text), and `message(text)`.
+`run_macro(source_path, lines, cursor_line, args)` reads the file,
+`compile()`+`exec()`s it into a FRESH namespace per run (never the
+module's own globals — one macro can't see another's state), looks for
+a module-level `run(ctx, args)`, calls it with stdout redirected into a
+capture buffer, and turns EVERY failure mode (unreadable file, syntax
+error, missing `run`, an exception raised inside it, a `MacroError`
+from `EditContext`'s own range-checking) into a `MacroResult` with
+`error` set — nothing ever propagates as an uncaught exception, since
+that would crash the shared backend process every other open tab
+depends on. `run_macro()`'s docstring and this whole module's own
+docstring both spell out the explicit "not yet built" list (global
+macro path, interactivity, labels/exclude/clipboard access, line
+insert/delete) so a future session doesn't have to reverse-engineer
+scope from what's missing.
+
+**Extension host (`extension/src/macros.ts`, new)**: `findMacroFile(document,
+name)` resolves `.spfvs/macros/<lowercased-name>.py` relative to
+`vscode.workspace.getWorkspaceFolder(document.uri)` — returns
+`undefined` (not an error) when there's no workspace folder or no
+matching file, both ordinary "not a macro" cases. `isWorkspaceTrustedForMacros()`
+is a thin wrapper around `vscode.workspace.isTrusted` — VS Code's own
+Workspace Trust gates macro execution, deliberately NOT a bespoke
+prompt this extension invents (same mechanism already gates
+`tasks.json` auto-run and similar risky automatic behavior elsewhere in
+VS Code). `ispfEditorProvider.ts` gained `handleMacroAction()`: checks
+trust, resolves the file, builds `lines`, calls the backend's new
+`runMacro()`, applies the result as an ordinary edit (see above), posts
+a new `"setCursor"` message if the macro moved the cursor, and reports
+success/failure through the existing `primaryActionResult` channel
+every other primary action already uses.
+
+**Invocation (`extension/media/primaryCommand.ts`)**: the `default:`
+case (previously: immediately return `"unknown primary command"`) now
+ALWAYS forwards instead — `{kind:"forward", action:"macro", name, args,
+cursorLine}` — since this sandboxed webview has no filesystem access to
+check for a macro file itself; the extension host now owns the final
+"is this a macro or genuinely unknown" decision, and reports the exact
+same `"unknown primary command '<name>'"` message back when it isn't,
+so a genuine typo still reads exactly as it always did.
+`main.ts` gained a `"setCursor"` message handler (`editor.setPosition`
++ `revealLine`) — needed because a macro's document edit already
+triggers the ordinary `"setContent"` path, whose `saveViewState`/
+`restoreViewState` would otherwise put the cursor back where it WAS
+rather than where the macro moved it to; `setCursor` arrives
+deliberately AFTER that, once `handleMacroAction`'s edit has been
+applied.
+
+**Shipped example (`.spfvs/macros/todocomment.py`, new)**: a full,
+tested, line-by-line translation of the owner's own REXX sample macro
+(a TODO-search-and-a-no-op-CHANGE loop, plus a "prefix every `/*` with
+`COMMENT: `" loop) — invoke it by opening this repo in SPFVS and typing
+`todocomment`. Its own doc comment quotes the original REXX and explains
+what each REXX/`ISREDIT` idiom (`ADDRESS ISREDIT` + quoted subcommands,
+`RC`-checked `DO WHILE` loops, `FIND FIRST`/`FIND NEXT`, reading
+`.ZLAST` like a variable) became in Python and why (mostly: Python
+already has iterators and real return values, so several REXX
+"features" just aren't needed at all rather than needing simulation —
+see the design conversation for the full idiom-by-idiom mapping).
+
+Backend: 19 new pytest cases in `backend/tests/test_macros.py` — every
+`EditContext` member in isolation, `run_macro()`'s full success/every-
+failure-mode matrix (missing file, syntax error, no `run` function, an
+exception raised inside `run()`, an out-of-range `MacroError`), that a
+failed macro leaves `lines`/`cursor_line` as `None` and never mutates
+the CALLER's own `lines` list, and — the most end-to-end one —
+`test_shipped_todocomment_example_macro`, which loads and runs the
+actual shipped `.spfvs/macros/todocomment.py` file (not a synthetic
+`tmp_path` fixture) and asserts its exact output, catching drift between
+this doc entry's description and the real shipped file automatically.
+**121 total backend tests, all passing** (102 existing, untouched, +
+19 new). `npm run typecheck` and `npm run compile` both pass.
+
+**Not yet packaged/installed or tested by the owner** — needs the usual
+version-bump/`vsce package`/`code --install-extension --force`/
+quit-relaunch cycle. Manual test focus once installed: open THIS repo
+(`spfvs`) in SPFVS itself (so `.spfvs/macros/todocomment.py` is
+reachable), type `todocomment` in `COMMAND ===>` on a file containing a
+`/* comment */` somewhere, confirm every `/*` gets `COMMENT: ` prefixed
+and the status message reports the line count; type a genuinely unknown
+word and confirm the ordinary "unknown primary command" error still
+appears unchanged; try it in an UNTRUSTED workspace and confirm macro
+execution is blocked with a clear message rather than silently doing
+nothing or silently running anyway.
+
+## Status as of 2026-09-15: SHIFT rebuilt against IBM's actual docs — `))` is a real BLOCK form, `>`/`<` removed
+
+**This supersedes two same-day false starts on SHIFT (both documented
+below, kept for the record) — this entry is the actually-correct,
+IBM-source-verified design.** The full arc, worth understanding before
+touching SHIFT again:
+
+1. Owner: "the line-shift commands... are not ispf-conform... there is
+   no ispf line command `)))` etc." — taken at face value, the
+   repeat-character multiplier (`))`=2x default, present since SHIFT's
+   original 2026-09-13 implementation) was removed.
+2. Owner tested `))1`, expected it to shift by 1, got an unexpected
+   rejection, and pushed back: "i specified: install the line shift
+   commands according to the corresponding ispf editor syntax" — at
+   this point this session's own (imperfect) recollection of ISPF said
+   the repeat-character form WAS real, so it was restored, net figuring
+   out nothing new about *actual* IBM documentation.
+3. Owner posted the actual IBM doc link:
+   https://www.ibm.com/docs/en/zos/2.1.0?topic=commands-column-shift-right
+   — fetched it (and the Column Shift Left, Data Shift Right, and Edit
+   Line Commands summary pages) directly via WebFetch rather than
+   guessing again. **This is the first point in the whole SHIFT saga
+   this session worked from a real source instead of recollection.**
+
+**What IBM's docs actually say** (syntax diagrams + prose, fetched
+verbatim): Column Shift Right/Left (`)`/`(`) have TWO real forms, not
+the "single line vs. repeat-to-multiply" shape this project had before:
+  - `)` / `)n` — shift THIS line, default width 2, or exactly n columns.
+  - `))` / `))n` — a **block** form: "Type `))` in the line command
+    field of the first line to be shifted... Type `))` in the line
+    command field of the last line to be shifted... the lines that
+    contain the two `))` commands and all of the lines between them are
+    column shifted" — i.e. `))` is a PAIRED MARKER like `dd`...`dd`, not
+    "shift this one line by double the default." `))n` puts an explicit
+    count on either marker. There is no `)))`/triple-or-more form at
+    all — that was this project's own repeated invention, wrong both
+    times it existed.
+  - Left (`(`/`(n`/`((`/`((n`) works identically, mirrored.
+
+**Separately, `>`/`<` are NOT aliases of `)`/`(` at all** — they're a
+different, genuinely distinct real ISPF command, **Data Shift**: "moves
+the body of a program statement to the right without shifting the label
+or comments," and — unlike Column Shift's blind truncation — "if you
+shift data beyond the current BOUNDS setting, the text stops at the
+right bound and the shifted lines are marked with `==ERR>` flags."
+Faithfully implementing this needs a BOUNDS setting (already deferred,
+see the 2026-09-13 ISPF-parity status entry's cluster #8) AND a
+language-specific definition of "label field"/"comment field" (trivial
+for COBOL's fixed columns, undefined for a generic multi-language
+editor) — neither exists in this project. Asked the owner how to handle
+this gap; **decision: remove `>`/`<` entirely for now** (deferred
+alongside BOUNDS/MASK/NUMBER, not faked as `)`/`(` aliases — that alias
+relationship never existed in real ISPF and was this project's own
+mistake).
+
+**Implementation**: `_SHIFT_RE` is now `^([()])(\1?)(\d*)$` — group 1
+the shift char (`)`/`(` only, `<`/`>` removed entirely), group 2 an
+OPTIONAL single repeat (present = block form), group 3 optional digits
+(valid on either form). A genuine new block-pairing mechanism,
+`_SHIFT_BLOCK_CODES = ("))", "((")`, was added to the SAME
+`pending_block`/`pending_*_count` machinery `dd`/`cc`/`mm`/`xx`/`rr`
+already use — new `pending_shift_count` dict (analogous to
+`pending_rr_count`, but keyed per direction since a `))` block and a
+`((` block could both be open in one batch) with `0` as the "no explicit
+count on this marker" sentinel (0 is otherwise always invalid for a
+shift amount, so it's unambiguous — unlike RR, which reuses `1` for
+this since 1 IS its legitimate default). Count resolution mirrors RR's
+tie-break exactly: closing marker's explicit count wins if both markers
+specify one, else whichever one did, else the default width. A new
+`("shift_block", start, end, delta, defining)` operation kind was added
+alongside the existing `("shift", line, delta, defining)`: unlike plain
+`shift` (deliberately exempt from the range/overlap validation loop,
+since it only ever touches one already-validated line), `shift_block`
+DOES have a real multi-line range and goes through that validation like
+any other block op (added to the `("case", "repeat_block", "paste",
+"shift_block")` unpacking group) — out-of-range and overlap-with-another-
+line-command are both caught the normal way. Building the document just
+applies the existing per-line shift formula to every line in the range,
+independently, with no `line_new_key` remapping needed (identity/order
+never changes, only text).
+
+Rewrote the whole SHIFT test block: single-line forms unchanged
+(`)`/`)n`/`(`/`(n`), a `)))`-style triple now explicitly asserts
+"unknown line command," `<`/`>` now explicitly assert "unknown line
+command" too (not an alias), and a full new suite for the block form
+(default width, count on opening marker, count on closing marker,
+closing-wins-when-both-specify, unmatched-is-an-error for both
+directions, labels survive a block shift untouched, overlap with a
+separate line command inside the block's range is rejected).
+**102 total tests, all passing.**
+
+Updated `README.md` (new table rows separating Column Shift's real block
+form from the removed `>`/`<`, a "Known limitations" bullet explaining
+the BOUNDS+label/comment-field gap), the module docstring, and
+`extension/src/helpText.ts` to all describe this exact final design —
+no lingering references to the two now-superseded attempts.
+
+`)))` and `>`/`<` correctly read as "unknown line command"; a lone
+unpaired `))` (or `))n`) now correctly reads as **"unmatched '))'
+starting at line N"** — a more accurate error than either prior
+attempt gave for the exact case (`))1`) that started this whole
+investigation, since `))1` really is meaningful ISPF syntax (an opening
+block marker with an explicit count), just one that was never closed in
+that test. `pytest` (102 tests) and `npm run typecheck`/`npm run
+compile` both pass. No repackage needed for the backend fix itself
+(editable install), but `extension/src/helpText.ts` DID change this
+round, so package/install before relying on `HELP`'s SHIFT section
+being accurate. **Not yet tested by the owner** — verify in particular:
+`))`...`))` and `((`...`((` block shifts (with and without an explicit
+count on either marker), an unmatched `))`/`((` rejects the batch, and
+`>`/`<` are now plain unrecognized commands (not silently doing
+anything).
+
+## Status as of 2026-09-14: HELP primary command
 
 Owner asked for a "help primary command which shows all actual
 implemented primary and line command syntax." New `HELP`/`H` primary
@@ -706,36 +1301,28 @@ per-webview-module-instance pattern as `excludeFolding.ts`'s
 reveal-hidden-hits fix from the previous status entry.
 
 **SHIFT line commands** (`backend/ispf_backend/prefix_commands.py`):
-`)`/`>` shift a line's text right, `(`/`<` shift left, each by 2 columns
-times the number of repeated characters (`))` = 4, `<<<` = 6); `)n`/`(n`/
-`>n`/`<n` shift by an exact column count instead. `<`/`>` are pure
-aliases for `(`/`)` — this mirrors the real ISPF convention where both
-spellings are accepted (the exact **default width** of 2 is this
-project's own choice, not independently verified against IBM's
-profile-configurable default — flagged in README). Shift LEFT blindly
-drops the leftmost n characters (blank or not, can truncate real text) —
-deliberately matching ISPF's actual (somewhat dangerous) behavior rather
-than being "smart" about only eating whitespace. Implementation notes for
-future sessions: SHIFT is parsed via a new `_SHIFT_RE` BEFORE
-`_parse_one` gets a chance (same pattern as the `.`/label check above
-it), and is explicitly exempted from the shared range/overlap-validation
-loop (`if kind == "shift": continue`) — its second operation-tuple field
-is a signed column delta, not an end-line, so letting it fall through to
-the generic `delete/repeat/insert/exclude` unpacking would silently
-misinterpret that delta as an end-line and could raise a bogus
-"extends past end of file" error for an ordinary large rightward shift.
-SHIFT never touches `line_new_key` (it changes a line's TEXT, not its
-identity/position), so any label or excluded-state on a shifted line is
-correctly left alone — reuses the existing remap machinery for free.
+**this original design is SUPERSEDED — see the 2026-09-15 status entry
+above ("SHIFT rebuilt against IBM's actual docs") for the current,
+IBM-source-verified behavior.** In short: `)`/`(` single-line shift is
+unchanged; the "repeat the character to multiply the shift" idea
+described here originally was wrong twice over (`)))`+ was never valid,
+and `))` is actually a real ISPF BLOCK marker paired like `dd`...`dd`,
+not "shift this one line by double"); `<`/`>` were never real aliases of
+`(`/`)` at all — they're a different, unimplemented ISPF command (Data
+Shift) and have been removed rather than kept as incorrect aliases.
+Don't use anything in this paragraph as current truth; the SHIFT section
+of the module docstring in `prefix_commands.py` itself is correct and
+current.
 
-Backend: 11 new pytest cases for SHIFT (default/double/explicit-count
-right, blank-removal/truncation/past-length left, angle-bracket aliases,
-zero-amount rejection, label survives a shift, malformed code falls back
-to "unknown line command"), 65 total, all passing. `npm run typecheck`
-passes. **Neither of these two features has been packaged/installed or
-tested by the owner yet** — see the manual test checklist below, and
-remember the standing gotcha from the LABEL entry: compiling isn't
-enough, the `.vsix` must actually be rebuilt and reinstalled (bump
+Backend: 11 new pytest cases for SHIFT shipped in this original round
+(single-line default/explicit-count right and left, truncation, zero-
+amount rejection, label survives a shift, malformed code falls back to
+"unknown line command"), 65 total at the time. All since superseded/
+expanded by the 2026-09-15 rework (102 total as of that entry). `npm run
+typecheck` passes. **Neither of these two features has been packaged/
+installed or tested by the owner yet** — see the manual test checklist
+below, and remember the standing gotcha from the LABEL entry: compiling
+isn't enough, the `.vsix` must actually be rebuilt and reinstalled (bump
 `extension/package.json`'s version, `vsce package`,
 `code --install-extension --force`, then a full quit+relaunch of VS
 Code) before any of this is reachable in the real UI.
@@ -925,13 +1512,33 @@ commit/push again on your own initiative, only when asked.
     stdin/stdout, request-id keyed.
   - `src/helpText.ts` — the `HELP`/`H` primary command's static
     `HELP_TEXT` string (added 2026-09-14), a hand-maintained plain-text
-    mirror of README.md's command tables. Lives in `src/`, not `media/`,
+    mirror of README.md's command tables (now including the Edit Macros
+    section, added 2026-09-15). Lives in `src/`, not `media/`,
     since it's only ever read by `ispfEditorProvider.ts` (opening a new
     tab is extension-host-only) — keep it in sync manually with README
     whenever a command's syntax changes, same discipline as this file's
     own "Conventions" section already asks for.
+  - `src/macros.ts` — edit-macro support, Phase 1 (added 2026-09-15, see
+    Status above for the full design rationale). `findMacroFile(document,
+    name)` resolves `.spfvs/macros/<name>.py` relative to the document's
+    workspace folder; `isWorkspaceTrustedForMacros()` gates execution on
+    VS Code's own Workspace Trust. `ispfEditorProvider.ts`'s
+    `handleMacroAction` is the actual orchestration (lookup → backend
+    `runMacro()` call → apply result as an ordinary `appliedByUs` edit,
+    same path plain Monaco keystrokes use, deliberately not the
+    `pendingBatchEditVersions` remapping path — Phase 1 macros can't
+    change the line count, so there's nothing to remap yet).
+    `handleMacroAction` gained a `labels` parameter 2026-09-16 (see
+    Status above) — the same closure-local map prefix-command batches
+    and `CUT`/`PASTE` already read, now ALSO handed to
+    `runMacro()`/`EditContext.resolve_label()`, read-only.
   - `media/main.ts` — webview entry: boots Monaco, wires the gutter and
-    command bar, message bridge to the extension host.
+    command bar, message bridge to the extension host. Handles a
+    `"setCursor"` message (added 2026-09-15) that moves the real cursor
+    after a macro run — arrives deliberately AFTER the edit's own
+    `"setContent"` message, whose `saveViewState`/`restoreViewState`
+    would otherwise put the cursor back where it was instead of where
+    the macro moved it.
   - `media/gutter.ts` — the editable prefix-command gutter. **Read the
     class doc comment before touching this file** — it explains why it's
     a plain DOM overlay (pooled/recycled `<input>` elements, windowed to
@@ -999,7 +1606,12 @@ commit/push again on your own initiative, only when asked.
     `clearViewZones` (added 2026-09-14, see Status above), is called by
     plain `RESET`/`RES` to hide any shown `hx`/`cols` zones alongside its
     existing un-hide-EXCLUDEd-lines job — `main.ts` wires it to both
-    `HexView`/`ColsView`'s `hideAll()`.
+    `HexView`/`ColsView`'s `hideAll()`. The `default:` switch case (added
+    2026-09-15, see Status above) no longer resolves "unknown primary
+    command" itself — it forwards EVERY non-built-in word as a
+    `{action:"macro", name, args, cursorLine}` outcome instead, since
+    macro files live on the filesystem this sandboxed webview can't see;
+    the extension host makes the final "macro or genuinely unknown" call.
   - `media/excludeFolding.ts` — EXCLUDE/RESET/x/xx's real implementation:
     Monaco's public folding API (`registerFoldingRangeProvider` +
     `editor.fold`/`editor.unfoldAll` triggers), NOT the lower-level
@@ -1023,21 +1635,40 @@ commit/push again on your own initiative, only when asked.
   2026-09-13 status entry for why that one had to be genuine module
   state). `prefix_commands.py`'s module docstring documents the full
   supported command grammar and validation rules, including LABEL
-  (`.name`/`.`), EXCLUDE (`x[n]`/`xx`...`xx`), SHIFT (`)`/`((`/`>`/`<<`/
-  etc.), `RR`...`RR` block repeat, `UC`/`LC` case conversion, and the
+  (`.name`/`.`), EXCLUDE (`x[n]`/`xx`...`xx`), SHIFT — Column Shift
+  `)`/`)n`/`(`/`(n` single-line plus a REAL block form `))`...`))`/
+  `((`...`((` (paired markers like `dd`...`dd`, not a repeat-to-multiply
+  trick — rebuilt against actual IBM docs 2026-09-15, see Status; `>`/`<`
+  removed entirely, they're a different unimplemented ISPF command, not
+  aliases) — `RR`...`RR` block repeat, `UC`/`LC` case conversion, and the
   2026-09-14 `pending_mark`/`execute_cut`/`execute_paste` design: an
   unpaired `c[n]`/`cc`/`m[n]`/`mm` becomes a pending copy/move mark
   (paired ones are unaffected, unchanged in-file copy/move), resolved by
   the `CUT`/`PASTE` **primary** commands via `process()`'s
   `execute_cut`/`execute_paste` flags — `prefix_commands.py` itself never
   parses the words `cut`/`paste`, those only exist in
-  `primaryCommand.ts` now. `pytest backend/tests/` — **94 tests, all
-  passing**, covers single and block delete/repeat/insert/copy/move
+  `primaryCommand.ts` now. `macros.py` (added 2026-09-15, see Status
+  above) is a SEPARATE module with its own request type (`server.py`'s
+  `"type": "runMacro"` dispatch) — a macro's `EditContext`/`run_macro()`
+  never touches `prefix_commands.py` or its `process()` engine at all.
+  `EditContext.resolve_label()` (added 2026-09-16, see Status above) is
+  the one place macros DO touch caller-owned state also used elsewhere
+  (the `labels` map) — but strictly read-only, passed in fresh on every
+  call, never written back. `EditContext.insert_after`/`insert_before`/
+  `delete_line`/`delete_lines` (also added 2026-09-16, see Status above)
+  let a macro change the document's LINE COUNT for the first time —
+  Copy/Move have no dedicated method, composed from these plus
+  `get_line` instead (see `.spfvs/macros/duplicateline.py`).
+  `pytest backend/tests/` — **151 tests, all
+  passing** (102 in `test_prefix_commands.py` + 49 in `test_macros.py`),
+  covers single and block delete/repeat/insert/copy/move
   including move-up (destination line above the source), every
   documented error case, LABEL set/clear/reassign/reserved-name/case-
   folding/duplicate-in-batch, EXCLUDE set/count/block/unmatched/
-  accumulate, SHIFT right/left/explicit-count/angle-bracket-aliases/
-  truncation, RR default/opening-count/closing-count/unmatched, UC/LC
+  accumulate, SHIFT single-line right/left/explicit-count/truncation plus
+  the block form's default/opening-count/closing-count/closing-wins/
+  unmatched/label-survives/overlap-rejected, `>`/`<` and `)))`+ correctly
+  unknown-command, RR default/opening-count/closing-count/unmatched, UC/LC
   single/range/too-many-markers/case-insensitivity, and the
   pending-mark/CUT/PASTE design (mark creation single/block/copy/move,
   setting-while-pending is an error, remapping through same-batch and
@@ -1045,9 +1676,14 @@ commit/push again on your own initiative, only when asked.
   execute_cut both mark kinds and its no-mark error, execute_paste
   after/before/empty-clipboard-error/non-consuming, and
   cut-in-one-document-then-paste-in-another), all plus remapping through
-  every restructuring op where applicable. This is the trustworthy,
-  already-verified layer; the webview/gutter wiring is the layer still
-  under manual test.
+  every restructuring op where applicable, PLUS (in `test_macros.py`)
+  every `EditContext` member in isolation, `run_macro()`'s full success/
+  every-failure-mode matrix, and `test_shipped_todocomment_example_macro`
+  — the one integration test that loads and runs the ACTUAL shipped
+  `.spfvs/macros/todocomment.py` file rather than a synthetic fixture, so
+  this file's own description of that macro can't silently drift from
+  what it really does. This is the trustworthy, already-verified layer;
+  the webview/gutter wiring is the layer still under manual test.
 
 ## Build / package / install (what "run it" actually means right now)
 
@@ -1204,13 +1840,32 @@ real file in the installed extension:
   a literal one-word search that happens to spell `first`/`last`/`all`
   (e.g. `find first`) should search for that word, not be misread as the
   scope keyword.
-- SHIFT line commands (new 2026-09-13, entirely unexercised): `)`/`>`
-  shift a line right, `(`/`<` shift left, both by 2 columns; `))`/`>>`/
-  `((`/`<<` shift by 4; `)6`/`(6`/`>6`/`<6` shift by exactly 6 columns;
-  shifting left past the line's actual content should truncate it (not
-  error) — verify that's what actually happens on screen, since it's a
-  real (if ISPF-authentic) way to lose text; a shifted line's label (if
-  any) should stay put.
+- SHIFT line commands (rebuilt 2026-09-15 against actual IBM docs —
+  entirely unexercised in this final shape): `)` shifts a line right by
+  the default 2 columns, `(` shifts left; `)6`/`(6` shift by exactly 6
+  columns; `))1` alone (unpaired) should be REJECTED as **"unmatched
+  '))' starting at line N"** (not "unknown command") — this is the exact
+  case that kicked off this whole investigation, so it's the single most
+  important thing to re-verify; `)))` (three or more) should be REJECTED
+  as "unknown line command"; `>` and `<` alone should ALSO be "unknown
+  line command" (they used to be treated as aliases of `)`/`(` — confirm
+  that's really gone, not silently still shifting); shifting left past a
+  line's actual content should truncate it (not error); a shifted line's
+  label should stay put.
+- SHIFT BLOCK form (new 2026-09-15, entirely unexercised — this is the
+  actual real ISPF construct `))`/`((` turned out to be): type `))` on
+  one line and `))` again on a later line, commit, and confirm every
+  line from the first to the last (inclusive) shifted right by the
+  default 2 columns — NOT just the two marker lines; try `((`...`((` for
+  left; put an explicit count on the OPENING marker only (`))3`...`))`)
+  and confirm the whole block shifts by 3; put it on the CLOSING marker
+  only (`))`...`))3`) — same result; put DIFFERENT counts on both
+  (`))5`...`))3`) and confirm the CLOSING one (3) wins; an unmatched
+  `))` or `((` (opened, never closed) should reject the whole batch; a
+  label on a line inside the shifted block should stay on that same
+  line, unmoved; a separate line command (e.g. `d`) on a line INSIDE a
+  `))`...`))` range should be rejected as overlapping, same as it would
+  be for `dd`...`dd`.
 - View stays put after a prefix-command commit (new 2026-09-13, entirely
   unexercised): scroll deep into a large file, commit `)`/any other
   prefix command there, and confirm the view stays on that page instead
@@ -1349,6 +2004,68 @@ real file in the installed extension:
   not reused/tracked); spot-check the listed syntax against a few
   recently-added commands (WORD qualifier, COLS, CUT/PASTE) for drift
   against `helpText.ts`'s hand-maintained content.
+- Edit macros, Phase 1 (new 2026-09-15, entirely unexercised — the
+  actual real-world test of the whole design): open THIS repo (`spfvs`)
+  in SPFVS itself, put the cursor anywhere, and type `todocomment` in
+  `COMMAND ===>` — every line containing `/*` should get `COMMENT: `
+  prefixed onto that `/*`, and the status message should report
+  `ISPF EDIT MACRO FINISHED` / the file's line count; confirm the
+  document is genuinely dirty/undoable afterward (Ctrl+Z should revert
+  it, same as any other edit); type a genuinely unknown word (no
+  matching `.spfvs/macros/*.py`) and confirm the ordinary "unknown
+  primary command" error still appears, unchanged from before macros
+  existed; open a DIFFERENT file/folder that VS Code treats as
+  untrusted (or explicitly restrict trust) and confirm typing
+  `todocomment` there is blocked with a clear message rather than either
+  silently doing nothing or silently running anyway — this is the one
+  actual safety mechanism in Phase 1, worth verifying carefully rather
+  than assuming; try a macro name that collides with a real primary
+  command (e.g. create `.spfvs/macros/save.py` and confirm typing `save`
+  still does the REAL save, never reaches the macro file) to confirm
+  built-ins still win as designed.
+- `ctx.resolve_label()` (new 2026-09-16, entirely unexercised): in a
+  real file, set a label with `.foo` in the gutter and commit that
+  batch; create a small test macro (e.g.
+  `.spfvs/macros/showlabel.py`) whose `run(ctx, args)` does
+  `ctx.message(str(ctx.resolve_label(".foo")))` and confirm it reports
+  the correct line number; confirm `.ZFIRST`/`.ZLAST` report line 1 /
+  the last line, and `.ZCSR` reports wherever the cursor actually was
+  when the macro ran; move `ctx.cursor_line` inside the SAME macro and
+  confirm a subsequent `resolve_label(".ZCSR")` call reflects the NEW
+  position, not the original one; resolve a label that was never set
+  and confirm it reports `None` rather than erroring.
+- Macro output routing to "SPFVS Macros" (new 2026-09-16, entirely
+  unexercised): run `todocomment` and confirm the status bar shows a
+  short summary + `— see "SPFVS Macros" output for full result` rather
+  than a truncated wall of text, AND that the "SPFVS Macros" output
+  channel actually opens (without stealing focus from the editor) and
+  contains the full two-line message prefixed with `[todocomment]`; do
+  the same for `showlabel foo`; write a trivial macro whose message is
+  a short one-liner (e.g. `ctx.message("done")`) and confirm THAT one
+  still shows directly in the status bar with no output channel
+  involvement at all — this is the regression check, since the routing
+  logic must not affect the common short-message case; check the output
+  channel is reachable from the normal "Output" panel dropdown (it's a
+  real `vscode.OutputChannel`, not anything bespoke).
+- Macro insert/delete-line support (new 2026-09-16, entirely
+  unexercised — the first macro capability that changes the document's
+  LINE COUNT, worth testing carefully): `duplicateline` on some line
+  duplicates it right after itself and the line count grows by one;
+  `duplicateline before` puts the copy before instead; `duplicateline
+  move` relocates the line to the end of the file (count UNCHANGED,
+  content reordered) rather than copying it; confirm the resulting
+  document is genuinely dirty/undoable (Ctrl+Z reverts it) same as any
+  other edit; if a label was set anywhere in the file before running
+  any of these, confirm it's DROPPED afterward (expected — same
+  "ordinary edit resets caller-owned state" behavior every other
+  non-batch edit already has, not a new regression to chase); write a
+  quick throwaway macro that does `ctx.delete_lines(a, b)` spanning the
+  cursor's own current line and confirm the real editor's cursor ends
+  up on a valid line afterward (the new `_clamp_cursor` behavior) rather
+  than erroring or landing somewhere nonsensical; try `insert_after`/
+  `insert_before`/`delete_line`/`delete_lines` with an out-of-range line
+  number and confirm the macro fails with a clear
+  `line N is out of range` message, same as any other macro error.
 
 ## Conventions
 

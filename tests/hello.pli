@@ -1,0 +1,21 @@
+/*
+ * Simple "Hello, World" example in PL/I.
+ *
+ * This program writes a greeting and the (currently uninitialized)
+ * value of the variable HE to the default output device.
+ */
+ hello: proc options(main);
+   /*
+    * HE is declared as a variable-length character string with
+    * a maximum length of 10 characters. It is not explicitly
+    * assigned before use in this simple example.
+    */
+   dcl he char(10) var;
+
+   /*
+    * PUT SKIP LIST writes the specified items followed by a line break.
+    * Here we output the literal text "hello world" and then the value
+    * of HE.
+    */
+   put skip list("hello world", he);
+ end;

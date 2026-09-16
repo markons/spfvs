@@ -275,6 +275,17 @@ window.addEventListener("message", (event: MessageEvent) => {
       commandMessage.textContent = message.message ?? "";
       commandMessage.classList.toggle("ispf-command-error", !!message.isError);
       break;
+    case "setCursor":
+      // Sent after a macro run (see ispfEditorProvider.ts's
+      // handleMacroAction) — arrives AFTER the "setContent" the
+      // resulting document edit already triggered, whose own
+      // saveViewState/restoreViewState above would otherwise put the
+      // cursor back where it was rather than where the macro moved it.
+      if (editor && typeof message.line === "number") {
+        editor.setPosition({ lineNumber: message.line, column: 1 });
+        editor.revealLine(message.line);
+      }
+      break;
   }
 });
 
